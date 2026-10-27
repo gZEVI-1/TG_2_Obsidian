@@ -10,8 +10,8 @@ Telegram-бот с AI-агентом для работы с Obsidian через 
 |---|------|----------|--------|
 | 0 | Уточнение требований и проверка окружения | [00_requirements.md](00_requirements.md) | готово |
 | 1 | Каркас проекта и конфигурация | [01_env_setup.md](01_env_setup.md) | готово |
-| 2 | Скелет Telegram-бота (`aiogram 3.x`) | — | запланировано |
-| 3 | Клиент Obsidian Local REST API + dry-run | — | запланировано |
+| 2 | Скелет Telegram-бота (`aiogram 3.x`) | [02_telegram_bot_skeleton.md](02_telegram_bot_skeleton.md) | готово |
+| 3 | Клиент Obsidian Local REST API + dry-run | [03_obsidian_client.md](03_obsidian_client.md) | готово |
 | 4 | LLM-клиент (OpenAI-совместимый API) | — | запланировано |
 | 5 | Агент с инструментами | — | запланировано |
 | 6 | Шаблоны заметок и «мой стиль» | — | запланировано |
@@ -26,9 +26,19 @@ Telegram-бот с AI-агентом для работы с Obsidian через 
 
 ## Текущее состояние
 
-Готов Этап 1: проект в репозитории `TG_2_Obsidian` запускается командой
-`python -m app`, конфигурация читается из `.env`, секреты в логи не попадают.
-Telegram-бот ещё не подключён.
+Готов Этап 3. Бот на `aiogram 3.x` запускается командой `python -m app`,
+отвечает на `/start` и `/help`, повторяет текст эхом. Клиент Obsidian умеет
+проверять соединение, читать и записывать заметки; запись по умолчанию
+заблокирована dry-run.
+
+Служебные команды:
+
+```powershell
+.\.venv\Scripts\python.exe -m app --check-config     # настройки, без сети
+.\.venv\Scripts\python.exe -m app --check-obsidian   # Local REST API + тестовая запись
+```
+
+LLM ещё не подключён — это Этап 4.
 
 ## Смежные папки
 
