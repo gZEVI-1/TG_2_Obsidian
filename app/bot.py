@@ -10,10 +10,13 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
+    BotCommand,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
 )
 
 from app.agent import SYSTEM_PROMPT, Agent, Proposal
@@ -38,6 +41,24 @@ PREVIEW_CHARS = 700
 MAX_FOLDER_CHOICES = 3
 MAX_BUTTON_CHARS = 40
 
+BTN_NEW = "🆕 Новый диалог"
+BTN_HELP = "📖 Справка"
+BTN_START = "🔄 Начать заново"
+
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=BTN_NEW), KeyboardButton(text=BTN_HELP)],
+        [KeyboardButton(text=BTN_START)],
+    ],
+    resize_keyboard=True,
+)
+
+COMMANDS = [
+    BotCommand(command="start", description="Начать заново"),
+    BotCommand(command="help", description="Справка"),
+    BotCommand(command="new", description="Новый диалог"),
+]
+
 START_TEXT = (
     "Привет! Я ваш помощник по Obsidian.\n\n"
     "Могу найти и прочитать заметку, сохранить новую мысль, дописать в нужный "
@@ -53,7 +74,8 @@ HELP_TEXT = (
     "• заменить или дополнить раздел.\n\n"
     "Просто скажите, что нужно: «сохрани мысль…», «допиши в заметку про…», "
     "«замени раздел…». Перед записью покажу, что именно изменю.\n\n"
-    "Команды: /start — новый диалог, /help — эта справка, /new — забыть контекст."
+    "Команды: /start — новый диалог, /help — эта справка, /new — забыть "
+    "контекст. То же самое — кнопками внизу."
 )
 
 
@@ -114,18 +136,38 @@ class ChatMemory:
 @router.message(CommandStart())
 async def cmd_start(message: Message, memory: ChatMemory) -> None:
     memory.clear(message.chat.id)
-    await message.answer(START_TEXT)
+    await message.answer(START_TEXT, reply_markup=MAIN_KEYBOARD)
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
-    await message.answer(HELP_TEXT)
+    await message.answer(HELP_TEXT, reply_markup=MAIN_KEYBOARD)
 
 
 @router.message(Command("new"))
 async def cmd_new(message: Message, memory: ChatMemory) -> None:
     memory.clear(message.chat.id)
-    await message.answer("Новый диалог начат: предыдущие сообщения забыты.")
+    await message.answer(
+        "Новый диалог начат: предыдущие сообщения забыты.",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+# Кнопки клавиатуры дублируют команды точным совпадением текста: модель
+# не участвует, поэтому нажатие всегда означает одно и то же.
+@router.message(F.text == BTN_START)
+async def btn_start(message: Message, memory: ChatMemory) -> None:
+    await cmd_start(message, memory)
+
+
+@router.message(F.text == BTN_HELP)
+async def btn_help(message: Message) -> None:
+    await cmd_help(message)
+
+
+@router.message(F.text == BTN_NEW)
+async def btn_new(message: Message, memory: ChatMemory) -> None:
+    await cmd_new(message, memory)
 
 
 @router.message(F.text)
@@ -166,7 +208,7 @@ async def answer_text(
         result = await agent.handle(messages)
     except LLMError as error:
         log.error("LLM не ответила: %s", error)
-        await message.answer(_llm_error_text(error))
+        await message.answer(_llm_error_text(error), reply_markup=MAIN_KEYBOARD)
         return
 
     if result.proposal is not None:
@@ -175,7 +217,9 @@ async def answer_text(
         return
 
     memory.add(chat_id, text, result.text)
-    await message.answer(result.text or "Модель вернула пустой ответ.")
+    await message.answer(
+        result.text or "Модель вернула пустой ответ.", reply_markup=MAIN_KEYBOARD
+    )
 
 
 async def _offer(
@@ -647,6 +691,8 @@ async def run_bot(settings: Settings) -> None:
     try:
         me = await bot.get_me()
         log.info("Бот @%s запущен, ожидаю сообщения", me.username)
+        # Меню команд у поля ввода: те же три команды, что и на клавиатуре.
+        await bot.set_my_commands(COMMANDS)
         # На случай, если для токена ранее был настроен webhook.
         await bot.delete_webhook(drop_pending_updates=True)
         # Объекты попадают в обработчики как keyword-аргументы (workflow data).
