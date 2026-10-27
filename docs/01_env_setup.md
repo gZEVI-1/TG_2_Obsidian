@@ -34,7 +34,8 @@ Telegram и Obsidian на этом этапе нет.
   вывод в stdout, принудительный UTF-8 для консоли Windows.
 - `app/__main__.py` — точка входа `python -m app`: загружает настройки,
   печатает безопасную сводку и предупреждение, если `OBSIDIAN_DRY_RUN=false`.
-- `requirements.txt` — `python-dotenv>=1.0,<2`.
+- `requirements.txt` — `python-dotenv>=1.0,<2` (позже дополнен `aiogram` и
+  `aiohttp` на Этапах 2–3).
 - `.env.example` — шаблон всех переменных с комментариями.
 - Собственный `.gitignore` не создавался: в репозитории уже есть стандартный
   Python-`.gitignore`, он исключает `.env` и `.venv/` (проверено:
