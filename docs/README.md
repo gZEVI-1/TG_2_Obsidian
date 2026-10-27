@@ -12,7 +12,7 @@ Telegram-бот с AI-агентом для работы с Obsidian через 
 | 1 | Каркас проекта и конфигурация | [01_env_setup.md](01_env_setup.md) | готово |
 | 2 | Скелет Telegram-бота (`aiogram 3.x`) | [02_telegram_bot_skeleton.md](02_telegram_bot_skeleton.md) | готово |
 | 3 | Клиент Obsidian Local REST API + dry-run | [03_obsidian_client.md](03_obsidian_client.md) | готово |
-| 4 | LLM-клиент (OpenAI-совместимый API) | — | запланировано |
+| 4 | LLM-клиент (OpenAI-совместимый API) | [04_llm_client.md](04_llm_client.md) | готово |
 | 5 | Агент с инструментами | — | запланировано |
 | 6 | Шаблоны заметок и «мой стиль» | — | запланировано |
 | 7 | Автолинковка связей | — | запланировано |
@@ -26,19 +26,22 @@ Telegram-бот с AI-агентом для работы с Obsidian через 
 
 ## Текущее состояние
 
-Готов Этап 3. Бот на `aiogram 3.x` запускается командой `python -m app`,
-отвечает на `/start` и `/help`, повторяет текст эхом. Клиент Obsidian умеет
-проверять соединение, читать и записывать заметки; запись по умолчанию
-заблокирована dry-run.
+Готов Этап 4. Бот на `aiogram 3.x` запускается командой `python -m app`,
+отвечает на `/start` и `/help`, любой текст отправляет модели и возвращает её
+ответ. Модель — OpenRouter, `nvidia/nemotron-3-ultra-550b-a55b:free`
+(`:free`-тариф, tool-calls проверены). Клиент Obsidian умеет проверять
+соединение, читать и записывать заметки; запись по умолчанию заблокирована
+dry-run.
 
 Служебные команды:
 
 ```powershell
 .\.venv\Scripts\python.exe -m app --check-config     # настройки, без сети
 .\.venv\Scripts\python.exe -m app --check-obsidian   # Local REST API + тестовая запись
+.\.venv\Scripts\python.exe -m app --check-llm        # модель + поддержка tool-calls
 ```
 
-LLM ещё не подключён — это Этап 4.
+Агент с инструментами и создание заметок — Этап 5.
 
 ## Смежные папки
 
