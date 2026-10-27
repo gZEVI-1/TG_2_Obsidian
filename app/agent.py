@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
 from app.config import Settings
 from app.llm import LLMClient, ToolCall
-from app.notes import validate_path
+from app.notes import slugify, validate_path
 from app.obsidian import ObsidianClient, ObsidianError
 
 log = logging.getLogger(__name__)
@@ -19,25 +20,30 @@ MAX_NOTE_CHARS = 4000
 MAX_SUGGESTED_FOLDERS = 3
 
 SYSTEM_PROMPT = (
-    "Ты помощник в Telegram, работаешь с хранилищем Obsidian пользователя.\n\n"
+    "Ты живой и дружелюбный помощник в Telegram. Работаешь с хранилищем Obsidian "
+    "пользователя и говоришь по-русски просто, по-человечески: без канцелярита, "
+    "длинных списков и служебных фраз вроде «выполняю запрос». Если что-то "
+    "непонятно, переспроси своими словами.\n\n"
     "Инструменты:\n"
     "- search_notes(query) — найти заметки по словам;\n"
-    "- list_folders() — список папок хранилища;\n"
+    "- list_folders() — папки хранилища;\n"
     "- read_note(path) — прочитать заметку;\n"
     "- create_note(title, content) — предложить новую заметку;\n"
-    "- append_note(path, content) — предложить дописать текст в конец заметки;\n"
-    "- edit_section(path, heading, content, mode) — предложить заменить (mode=replace) "
-    "или дополнить (mode=append) раздел заметки.\n\n"
-    "Правила:\n"
-    "1. Не выдумывай пути. Если пользователь называет заметку неточно, сначала search_notes.\n"
-    "2. Если подходящих заметок несколько или ничего не найдено, задай вопрос. Молча "
-    "ничего не создавай и не меняй.\n"
-    "3. Создание и изменение подтверждает пользователь: просто вызывай инструмент с "
-    "готовым текстом и кратко объясни, что предлагаешь.\n"
-    "4. Пути — относительно корня хранилища, с расширением .md.\n"
-    "5. Для правки сначала прочитай заметку и определи раздел по заголовку; если "
-    "раздел неясен, спроси.\n"
-    "6. Отвечай по-русски, кратко."
+    "- append_note(path, content, section) — дописать текст в заметку;\n"
+    "- edit_section(path, heading, content, mode) — изменить раздел заметки.\n\n"
+    "Как работать:\n"
+    "1. Не выдумывай пути: если заметка названа неточно, сначала search_notes.\n"
+    "2. Перед дописыванием прочитай заметку (read_note) и выбери раздел, к "
+    "которому текст относится по смыслу. Если подходящего раздела нет — оставь "
+    "section пустым, текст добавится в конец.\n"
+    "3. Не дублируй: если такой текст в заметке уже есть, ничего не добавляй, "
+    "а просто скажи об этом.\n"
+    "4. Если подходящих заметок несколько или не нашлось ни одной — спроси "
+    "пользователя, ничего не меняя молча.\n"
+    "5. Создание и изменение подтверждает пользователь: готовь текст и коротко "
+    "объясни, что предлагаешь.\n"
+    "6. Пути — относительно корня хранилища, с расширением .md.\n"
+    "7. Отвечай коротко и по делу."
 )
 
 TOOLS: list[dict[str, Any]] = [
@@ -102,12 +108,22 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "append_note",
-            "description": "Предложить дописать блок в конец существующей заметки.",
+            "description": (
+                "Предложить дописать текст в существующую заметку. Сначала прочитай "
+                "заметку и укажи раздел, к которому текст относится по смыслу."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Путь существующей заметки"},
                     "content": {"type": "string", "description": "Текст, который нужно дописать"},
+                    "section": {
+                        "type": "string",
+                        "description": (
+                            "Заголовок раздела без решёток, в конец которого дописать. "
+                            "Пусто — дописать в конец заметки."
+                        ),
+                    },
                 },
                 "required": ["path", "content"],
             },
@@ -140,10 +156,11 @@ TERMINAL_TOOLS = ("create_note", "append_note", "edit_section")
 
 FOLDER_PROMPT = (
     "Разложи заметку по папкам хранилища Obsidian.\n\n"
-    "Папки: {folders}\n\n"
+    "Существующие папки: {folders}\n\n"
     "Заметка «{title}»:\n{content}\n\n"
-    "Выбери до трёх подходящих папок. Ответь только их именами, каждое с новой "
-    "строки, без пояснений. Если ни одна не подходит — ответь «нет»."
+    "Выбери до трёх подходящих папок. Если ни одна не подходит, предложи "
+    "короткие имена новых папок (1–2 слова).\n"
+    "Ответь только именами папок, каждое с новой строки, без пояснений."
 )
 
 
@@ -211,12 +228,9 @@ class Agent:
     async def suggest_folders(
         self, title: str, content: str, folders: list[str]
     ) -> list[str]:
-        """Просит модель выбрать папки для новой заметки (FR-04)."""
-        if not folders:
-            return []
-
+        """Просит модель выбрать или предложить папки для новой заметки (FR-04)."""
         prompt = FOLDER_PROMPT.format(
-            folders=", ".join(folders[:60]),
+            folders=", ".join(folders[:60]) if folders else "папок пока нет",
             title=title,
             content=content[:1500],
         )
@@ -227,8 +241,10 @@ class Agent:
         known = {folder.lower(): folder for folder in folders}
         result: list[str] = []
         for line in response.text.splitlines():
-            name = line.strip().lstrip("-•*0123456789. ").strip()
-            folder = known.get(name.lower())
+            name = _clean_folder_line(line)
+            if not name:
+                continue
+            folder = known.get(name.lower()) or _clean_folder_path(name)
             if folder and folder not in result:
                 result.append(folder)
             if len(result) >= MAX_SUGGESTED_FOLDERS:
@@ -258,10 +274,16 @@ class Agent:
             return AgentResult(text="Модель предложила пустое изменение.")
 
         if call.name == "append_note":
+            section = _argument(call.arguments, "section")
             log.info("Предложение дописать: %s (%d симв.)", path, len(content))
             return AgentResult(
                 text="",
-                proposal=Proposal(kind="append", path=path, content=content),
+                proposal=Proposal(
+                    kind="append",
+                    path=path,
+                    heading=section,
+                    content=content,
+                ),
             )
 
         heading = _argument(call.arguments, "heading")
@@ -333,6 +355,23 @@ class Agent:
         if len(content) > MAX_NOTE_CHARS:
             return content[:MAX_NOTE_CHARS] + "\n\n[текст обрезан]"
         return content
+
+
+def _clean_folder_line(line: str) -> str:
+    """Убирает маркеры списка, нумерацию и кавычки из ответа модели."""
+    text = line.strip()
+    text = re.sub(r"^[\s\-–—•*·]+", "", text)
+    text = re.sub(r"^\d+[.)]\s*", "", text)
+    text = text.strip("`\"'«» .:")
+    if text.lower() in ("нет", "none", "no", "-"):
+        return ""
+    return text
+
+
+def _clean_folder_path(name: str) -> str:
+    """Приводит предложенное моделью имя папки к безопасному виду."""
+    parts = [slugify(part) for part in name.split("/") if part.strip()]
+    return "/".join(part for part in parts if part and part != "Без названия")
 
 
 def _assistant_tool_message(calls: tuple[ToolCall, ...]) -> dict[str, Any]:

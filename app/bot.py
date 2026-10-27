@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery,
@@ -22,6 +23,7 @@ from app.notes import (
     append_to_note,
     append_to_section,
     build_path,
+    contains_text,
     replace_section,
     validate_path,
 )
@@ -37,22 +39,21 @@ MAX_FOLDER_CHOICES = 3
 MAX_BUTTON_CHARS = 40
 
 START_TEXT = (
-    "Привет! Я помогу работать с вашим Obsidian.\n\n"
-    "Я помню контекст диалога, умею искать и читать заметки, создавать новые "
-    "и править разделы.\n"
-    "Команды /new и /start начинают новый диалог."
+    "Привет! Я ваш помощник по Obsidian.\n\n"
+    "Могу найти и прочитать заметку, сохранить новую мысль, дописать в нужный "
+    "раздел или поправить его. Говорите обычными словами — разберусь.\n\n"
+    "/new или /start начнут разговор с чистого листа."
 )
 
 HELP_TEXT = (
-    "Доступные команды:\n"
-    "/start — начать новый диалог\n"
-    "/help — эта справка\n"
-    "/new — новый диалог, предыдущие сообщения забываются\n\n"
-    "Примеры:\n"
-    "• «сохрани мысль: …» — предложу новую заметку;\n"
-    "• «допиши в заметку про X: …» — найду заметку и предложу дописать;\n"
-    "• «в заметке X замени раздел Y на …».\n\n"
-    "Любое изменение сначала покажу и спрошу подтверждение."
+    "Что я умею:\n"
+    "• найти заметку по описанию и пересказать её;\n"
+    "• сохранить мысль в новую заметку — вы выберете папку;\n"
+    "• дописать текст в подходящий раздел;\n"
+    "• заменить или дополнить раздел.\n\n"
+    "Просто скажите, что нужно: «сохрани мысль…», «допиши в заметку про…», "
+    "«замени раздел…». Перед записью покажу, что именно изменю.\n\n"
+    "Команды: /start — новый диалог, /help — эта справка, /new — забыть контекст."
 )
 
 
@@ -154,6 +155,13 @@ async def answer_text(
         *memory.get(chat_id),
         {"role": "user", "content": text},
     ]
+    bot = getattr(message, "bot", None)
+    if bot is not None:
+        try:
+            await bot.send_chat_action(chat_id, "typing")
+        except TelegramAPIError as error:
+            log.debug("Не удалось отправить статус «печатает»: %s", error)
+
     try:
         result = await agent.handle(messages)
     except LLMError as error:
@@ -254,30 +262,42 @@ async def on_auto(
         return
 
     folders = sorted({note.rsplit("/", 1)[0] for note in notes if "/" in note})[:50]
-    if not folders:
-        await callback.message.edit_text(
-            "В хранилище пока нет папок. Сохранить в Inbox?",
-            reply_markup=_inbox_keyboard(),
-        )
-        return
 
+    source = ""
     try:
         suggestions = await agent.suggest_folders(
             action.proposal.title, action.proposal.content, folders
         )
     except LLMError as error:
-        log.error("Не удалось подобрать папку: %s", error)
-        await callback.message.edit_text(
-            "Не удалось подобрать папку автоматически. Куда сохранить?",
-            reply_markup=_inbox_keyboard(),
+        log.warning("Не удалось подобрать папку: %s", error)
+        guesses = _guess_folders(
+            action.proposal.title, action.proposal.content, folders
         )
-        return
+        if guesses:
+            suggestions = guesses
+            source = "Модель сейчас недоступна, папки подобраны по названию.\n\n"
+        elif folders:
+            suggestions = folders[:MAX_FOLDER_CHOICES]
+            source = "Модель сейчас недоступна. Вот папки хранилища:\n\n"
+        else:
+            suggestions = []
+            source = "Модель сейчас недоступна, а папок в хранилище пока нет.\n\n"
 
     if not suggestions:
-        await callback.message.edit_text(
-            "Не смог уверенно определить папку. Куда сохранить?",
-            reply_markup=_inbox_keyboard(),
-        )
+        if folders:
+            action.folders = tuple(folders[:MAX_FOLDER_CHOICES])
+            memory.set_action(
+                callback.message.chat.id, action, callback.message.message_id
+            )
+            await callback.message.edit_text(
+                source + "Не понял, какая папка подходит. Выберите:",
+                reply_markup=_folder_choices(action),
+            )
+        else:
+            await callback.message.edit_text(
+                source + "Куда сохранить заметку?",
+                reply_markup=_inbox_keyboard(),
+            )
         return
 
     action.folders = tuple(suggestions)
@@ -285,7 +305,7 @@ async def on_auto(
         callback.message.chat.id, action, callback.message.message_id
     )
     await callback.message.edit_text(
-        "Куда сохранить заметку?", reply_markup=_folder_choices(action)
+        source + "Куда сохранить заметку?", reply_markup=_folder_choices(action)
     )
 
 
@@ -449,7 +469,14 @@ async def _apply(
     try:
         current = await obsidian.read_note(path)
         if proposal.kind == "append":
-            updated = append_to_note(current, proposal.content)
+            if contains_text(current, proposal.content):
+                return "Такой текст в заметке уже есть — дубликат не добавляю."
+            if proposal.heading:
+                updated = append_to_section(
+                    current, proposal.heading, proposal.content
+                )
+            else:
+                updated = append_to_note(current, proposal.content)
         elif proposal.mode == "replace":
             updated = replace_section(current, proposal.heading, proposal.content)
         else:
@@ -487,10 +514,12 @@ def _proposal_text(proposal: Proposal) -> str:
             f"{_preview(proposal.content)}\n\nКуда сохранить?"
         )
     if proposal.kind == "append":
-        return (
-            f"Дописать в «{proposal.path}»:\n\n"
-            f"{_preview(proposal.content)}\n\nПодтвердить?"
+        where = (
+            f"раздел «{proposal.heading}» в «{proposal.path}»"
+            if proposal.heading
+            else f"конец заметки «{proposal.path}»"
         )
+        return f"Дописать в {where}:\n\n{_preview(proposal.content)}\n\nПодтвердить?"
     verb = "Заменить" if proposal.mode == "replace" else "Дополнить"
     return (
         f"{verb} раздел «{proposal.heading}» в «{proposal.path}»:\n\n"
@@ -561,10 +590,25 @@ def _button_label(text: str) -> str:
     return text if len(text) <= MAX_BUTTON_CHARS else text[: MAX_BUTTON_CHARS - 1] + "…"
 
 
+def _guess_folders(title: str, content: str, folders: list[str]) -> list[str]:
+    """Запасной вариант без LLM: папки, чьё имя встречается в тексте заметки."""
+    text = f"{title} {content}".lower()
+    found = [
+        folder
+        for folder in folders
+        if folder.rsplit("/", 1)[-1].lower() in text
+    ]
+    return found[:MAX_FOLDER_CHOICES]
+
+
 def _llm_error_text(error: LLMError) -> str:
     message = str(error)
     if "HTTP 429" in message:
-        return "Модель сейчас перегружена (лимит запросов). Попробуйте позже."
+        return (
+            "У модели закончился дневной лимит бесплатных запросов (50 в сутки). "
+            "Он обнулится в 00:00 UTC — это 04:00 по Дубаю. Можно подождать "
+            "или сменить LLM_MODEL в .env на другую бесплатную модель."
+        )
     if "HTTP 401" in message or "HTTP 403" in message:
         return "Модель отклонила ключ. Проверьте LLM_API_KEY в .env."
     return "Не удалось получить ответ от модели. Попробуйте позже."

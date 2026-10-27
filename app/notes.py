@@ -85,15 +85,39 @@ def append_to_section(text: str, heading: str, body: str) -> str:
 
     lines = text.splitlines(keepends=True)
     existing = "".join(lines[section.start : section.end]).strip("\n")
-    merged = f"{existing}\n\n{body.strip()}" if existing else body
-    return replace_section(text, heading, merged)
+    return replace_section(text, heading, _join_blocks(existing, body.strip("\n")))
 
 
 def append_to_note(text: str, body: str) -> str:
     """Дописывает блок в конец заметки."""
     base = text.rstrip("\n")
     block = body.strip("\n")
-    return f"{base}\n\n{block}\n" if base else f"{block}\n"
+    return f"{_join_blocks(base, block)}\n" if base else f"{block}\n"
+
+
+_LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+
+
+def _join_blocks(existing: str, block: str) -> str:
+    """Склеивает блоки: элементы списка — без пустой строки, остальное — с ней."""
+    if not existing:
+        return block
+    if not block:
+        return existing
+
+    last_line = existing.splitlines()[-1]
+    first_line = block.splitlines()[0]
+    separator = "\n" if _LIST_ITEM.match(last_line) and _LIST_ITEM.match(first_line) else "\n\n"
+    return f"{existing}{separator}{block}"
+
+
+def contains_text(note: str, fragment: str) -> bool:
+    """Проверяет, есть ли фрагмент в заметке (без учёта регистра и пробелов)."""
+    def normalize(value: str) -> str:
+        return re.sub(r"\s+", " ", value).strip().lower()
+
+    needle = normalize(fragment)
+    return bool(needle) and needle in normalize(note)
 
 
 def _sections(text: str, heading: str) -> list[Section]:
