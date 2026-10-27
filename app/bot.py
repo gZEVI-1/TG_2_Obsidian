@@ -390,6 +390,13 @@ async def _resolve_folder(
     except (ObsidianError, aiohttp.ClientError) as error:
         return Choice(_obsidian_error_text(error))
 
+    new_folder = False
+    if folder.strip("/") != settings.agent_default_folder:
+        try:
+            new_folder = not await obsidian.folder_exists(folder)
+        except (ObsidianError, aiohttp.ClientError) as error:
+            return Choice(_obsidian_error_text(error))
+
     if exists:
         return Choice(
             f"Заметка уже существует: «{path}».\n\nДописать текст в неё?",
@@ -397,9 +404,14 @@ async def _resolve_folder(
             replace(action, stage="exists", path=path),
         )
 
-    if settings.agent_confirmation == "always":
+    if settings.agent_confirmation == "always" or new_folder:
+        question = (
+            f"Папки «{folder}» пока нет. Создать её и сохранить заметку «{path}»?"
+            if new_folder
+            else f"Создать заметку «{path}»?"
+        )
         return Choice(
-            f"Создать заметку «{path}»?",
+            question,
             _confirm_keyboard(),
             replace(action, stage="confirm", path=path),
         )

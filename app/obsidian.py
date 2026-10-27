@@ -114,6 +114,22 @@ class ObsidianClient:
             if len(out) >= MAX_LISTED_NOTES:
                 return
 
+    async def folder_exists(self, folder: str) -> bool:
+        """Проверяет, существует ли папка в хранилище."""
+        folder = folder.strip().strip("/")
+        url = f"{self._base_url}/vault/" + (
+            quote(folder, safe="/") + "/" if folder else ""
+        )
+        session = await self._ensure_session()
+        async with session.get(url, headers={"Accept": "application/json"}) as response:
+            if response.status == 200:
+                return True
+            if response.status == 404:
+                return False
+            raise ObsidianError(
+                f"GET /vault/{folder}: HTTP {response.status}", response.status
+            )
+
     async def note_exists(self, path: str) -> bool:
         session = await self._ensure_session()
         async with session.get(
