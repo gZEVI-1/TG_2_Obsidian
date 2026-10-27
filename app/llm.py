@@ -94,12 +94,19 @@ class LLMClient:
             payload["tools"] = list(tools)
 
         session = await self._ensure_session()
-        async with session.post(self._url, json=payload) as response:
-            body = await response.text()
-            if response.status != 200:
-                raise LLMError(
-                    f"POST /chat/completions: HTTP {response.status}: {_shorten(body)}"
-                )
+        try:
+            async with session.post(self._url, json=payload) as response:
+                body = await response.text()
+                status = response.status
+        except (aiohttp.ClientError, TimeoutError) as error:
+            # Сетевые ошибки и таймауты не должны всплывать наружу как
+            # необработанные исключения: у клиента единый тип ошибок.
+            raise LLMError(f"LLM недоступна: {error}") from error
+
+        if status != 200:
+            raise LLMError(
+                f"POST /chat/completions: HTTP {status}: {_shorten(body)}"
+            )
 
         try:
             data = json.loads(body)
