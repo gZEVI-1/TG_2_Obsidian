@@ -167,6 +167,9 @@ def main() -> None:
     except LLMError as error:
         log.error("LLM: %s", error)
         raise SystemExit(2) from error
+    except ObsidianError as error:
+        log.error("Obsidian: %s", error)
+        raise SystemExit(2) from error
 
 
 if __name__ == "__main__":

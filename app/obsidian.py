@@ -13,14 +13,20 @@ from app.config import Settings
 log = logging.getLogger(__name__)
 
 TIMEOUT_SECONDS = 10
+MAX_LISTED_NOTES = 500
+MAX_DEPTH = 3
 
 
 class ObsidianError(RuntimeError):
     """Ошибка при обращении к Obsidian Local REST API."""
 
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
 
 class ObsidianClient:
-    """Минимальный клиент: проверка соединения, чтение и запись заметок.
+    """Минимальный клиент: проверка соединения, поиск, чтение и запись заметок.
 
     Запись по умолчанию не выполняется, если включён dry-run.
     """
@@ -60,8 +66,53 @@ class ObsidianClient:
         session = await self._ensure_session()
         async with session.get(f"{self._base_url}/") as response:
             if response.status != 200:
-                raise ObsidianError(f"GET /: HTTP {response.status}")
+                raise ObsidianError(f"GET /: HTTP {response.status}", response.status)
             return await response.json(content_type=None)
+
+    async def search(self, query: str, limit: int) -> list[dict[str, Any]]:
+        """Полнотекстовый поиск по хранилищу (FR-09)."""
+        session = await self._ensure_session()
+        async with session.post(
+            f"{self._base_url}/search/simple/",
+            params={"query": query, "contextLength": 80},
+        ) as response:
+            if response.status != 200:
+                raise ObsidianError(
+                    f"POST /search/simple/: HTTP {response.status}", response.status
+                )
+            data = await response.json(content_type=None)
+        return list(data)[:limit]
+
+    async def list_notes(self) -> list[str]:
+        """Все .md-файлы хранилища, рекурсивно; глубина и число ограничены."""
+        notes: list[str] = []
+        await self._collect_notes("", 0, notes)
+        return sorted(notes)
+
+    async def _collect_notes(self, folder: str, depth: int, out: list[str]) -> None:
+        if depth > MAX_DEPTH or len(out) >= MAX_LISTED_NOTES:
+            return
+
+        url = f"{self._base_url}/vault/" + (
+            quote(folder, safe="/") + "/" if folder else ""
+        )
+        session = await self._ensure_session()
+        async with session.get(url, headers={"Accept": "application/json"}) as response:
+            if response.status == 404:
+                return
+            if response.status != 200:
+                raise ObsidianError(
+                    f"GET /vault/{folder}: HTTP {response.status}", response.status
+                )
+            data = await response.json(content_type=None)
+
+        for entry in data.get("files", []):
+            if entry.endswith("/"):
+                await self._collect_notes(f"{folder}/{entry}".strip("/"), depth + 1, out)
+            elif entry.endswith(".md"):
+                out.append(f"{folder}/{entry}".strip("/"))
+            if len(out) >= MAX_LISTED_NOTES:
+                return
 
     async def note_exists(self, path: str) -> bool:
         session = await self._ensure_session()
@@ -72,7 +123,9 @@ class ObsidianClient:
                 return True
             if response.status == 404:
                 return False
-            raise ObsidianError(f"GET {path}: HTTP {response.status}")
+            raise ObsidianError(
+                f"GET {path}: HTTP {response.status}", response.status
+            )
 
     async def read_note(self, path: str) -> str:
         session = await self._ensure_session()
@@ -80,9 +133,11 @@ class ObsidianClient:
             self._note_url(path), headers={"Accept": "text/markdown"}
         ) as response:
             if response.status == 404:
-                raise ObsidianError(f"Заметка не найдена: {path}")
+                raise ObsidianError(f"Заметка не найдена: {path}", 404)
             if response.status != 200:
-                raise ObsidianError(f"GET {path}: HTTP {response.status}")
+                raise ObsidianError(
+                    f"GET {path}: HTTP {response.status}", response.status
+                )
             return await response.text()
 
     async def write_note(self, path: str, content: str, *, overwrite: bool = False) -> bool:
@@ -107,7 +162,9 @@ class ObsidianClient:
         ) as response:
             if response.status not in (200, 201, 204):
                 body = await response.text()
-                raise ObsidianError(f"PUT {path}: HTTP {response.status}: {body[:200]}")
+                raise ObsidianError(
+                    f"PUT {path}: HTTP {response.status}: {body[:200]}", response.status
+                )
 
         log.info("Заметка записана: %s", path)
         return True

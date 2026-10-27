@@ -16,6 +16,7 @@ ENV_FILE = PROJECT_ROOT / ".env"
 
 DEFAULT_OBSIDIAN_BASE_URL = "http://127.0.0.1:27123"
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+CONFIRMATION_MODES = ("auto", "always", "never")
 
 _TRUE_VALUES = ("1", "true", "yes", "on")
 _FALSE_VALUES = ("0", "false", "no", "off")
@@ -32,6 +33,10 @@ class Settings:
     obsidian_base_url: str
     obsidian_api_key: str
     obsidian_dry_run: bool
+    agent_confirmation: str
+    agent_default_folder: str
+    agent_auto_folder: bool
+    agent_search_limit: int
     log_level: str
 
     def safe_summary(self) -> dict[str, str]:
@@ -44,6 +49,10 @@ class Settings:
             "obsidian_base_url": self.obsidian_base_url,
             "obsidian_api_key": _describe_secret(self.obsidian_api_key),
             "obsidian_dry_run": str(self.obsidian_dry_run).lower(),
+            "agent_confirmation": self.agent_confirmation,
+            "agent_default_folder": self.agent_default_folder,
+            "agent_auto_folder": str(self.agent_auto_folder).lower(),
+            "agent_search_limit": str(self.agent_search_limit),
             "log_level": self.log_level,
         }
 
@@ -74,6 +83,28 @@ def _env_bool(name: str, default: bool) -> bool:
     raise ValueError(f"{name}: ожидается true или false, получено {raw!r}")
 
 
+def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = _env_str(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"{name}: ожидается целое число, получено {raw!r}") from None
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name}: ожидается от {minimum} до {maximum}, получено {value}")
+    return value
+
+
+def _env_folder(name: str, default: str) -> str:
+    folder = _env_str(name, default).strip().strip("/")
+    if not folder:
+        return default
+    if ".." in folder.split("/"):
+        raise ValueError(f"{name}: путь не должен содержать «..»")
+    return folder
+
+
 def load_settings() -> Settings:
     """Читает .env (если есть) и переменные окружения, возвращает Settings."""
     if ENV_FILE.is_file():
@@ -87,6 +118,13 @@ def load_settings() -> Settings:
             f"LOG_LEVEL: ожидается одно из {', '.join(LOG_LEVELS)}, получено {log_level!r}"
         )
 
+    confirmation = _env_str("AGENT_CONFIRMATION", "auto").lower()
+    if confirmation not in CONFIRMATION_MODES:
+        raise ValueError(
+            "AGENT_CONFIRMATION: ожидается одно из "
+            f"{', '.join(CONFIRMATION_MODES)}, получено {confirmation!r}"
+        )
+
     return Settings(
         telegram_bot_token=_env_str("TELEGRAM_BOT_TOKEN"),
         llm_base_url=_env_str("LLM_BASE_URL"),
@@ -95,5 +133,9 @@ def load_settings() -> Settings:
         obsidian_base_url=_env_str("OBSIDIAN_BASE_URL", DEFAULT_OBSIDIAN_BASE_URL).rstrip("/"),
         obsidian_api_key=_env_str("OBSIDIAN_API_KEY"),
         obsidian_dry_run=_env_bool("OBSIDIAN_DRY_RUN", default=True),
+        agent_confirmation=confirmation,
+        agent_default_folder=_env_folder("AGENT_DEFAULT_FOLDER", "Inbox"),
+        agent_auto_folder=_env_bool("AGENT_AUTO_FOLDER", default=True),
+        agent_search_limit=_env_int("AGENT_SEARCH_LIMIT", default=5, minimum=1, maximum=20),
         log_level=log_level,
     )
