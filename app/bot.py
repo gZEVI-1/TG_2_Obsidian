@@ -21,13 +21,13 @@ MAX_HISTORY_MESSAGES = 20
 
 START_TEXT = (
     "Привет! Я помогу работать с вашим Obsidian.\n\n"
-    "Я помню контекст диалога. Команда /new начинает новый диалог.\n"
+    "Я помню контекст диалога. Команды /new и /start начинают новый диалог.\n"
     "Создание заметок появится на следующих этапах."
 )
 
 HELP_TEXT = (
     "Доступные команды:\n"
-    "/start — начать заново\n"
+    "/start — начать новый диалог\n"
     "/help — эта справка\n"
     "/new — новый диалог, предыдущие сообщения забываются\n\n"
     "Любой текст я отправлю модели и верну её ответ."
@@ -59,7 +59,8 @@ class ChatMemory:
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message) -> None:
+async def cmd_start(message: Message, memory: ChatMemory) -> None:
+    memory.clear(message.chat.id)
     await message.answer(START_TEXT)
 
 
