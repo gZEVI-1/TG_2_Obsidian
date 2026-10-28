@@ -22,6 +22,14 @@ from aiogram.types import (
 
 from app.agent import Agent, Proposal
 from app.config import Settings
+from app.links import (
+    add_links,
+    duplicate_titles,
+    existing_links,
+    is_linked,
+    link_label,
+    mention_paths,
+)
 from app.llm import LLMAllExhaustedError, LLMError, LLMPool, LLMStatus
 from app.notes import (
     append_to_note,
@@ -49,6 +57,8 @@ PREVIEW_CHARS = 700
 MAX_FOLDER_CHOICES = 3
 MAX_TEMPLATE_CHOICES = 6
 MAX_BUTTON_CHARS = 40
+BULK_LINK_NOTES = 300
+BULK_LINK_EXAMPLES = 5
 
 BTN_NEW = "🆕 Новый диалог"
 BTN_HELP = "📖 Справка"
@@ -60,6 +70,7 @@ BTN_NOTE_NEW = "📝 Новая заметка"
 BTN_NOTE_APPEND = "➕ Дописать"
 BTN_NOTE_EDIT = "✏️ Править раздел"
 BTN_NOTE_FIND = "🔎 Найти"
+BTN_LINKS = "🔗 Связи во всех заметках"
 
 # Страница 1: вход в чат. Страница 2: сценарии работы с заметками.
 KEYBOARD_HOME = ReplyKeyboardMarkup(
@@ -75,6 +86,7 @@ KEYBOARD_SCENARIOS = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_NOTE_NEW), KeyboardButton(text=BTN_NOTE_APPEND)],
         [KeyboardButton(text=BTN_NOTE_EDIT), KeyboardButton(text=BTN_NOTE_FIND)],
+        [KeyboardButton(text=BTN_LINKS)],
         [KeyboardButton(text=BTN_BACK)],
     ],
     resize_keyboard=True,
@@ -84,6 +96,7 @@ COMMANDS = [
     BotCommand(command="start", description="Начать заново"),
     BotCommand(command="help", description="Справка"),
     BotCommand(command="new", description="Новый диалог"),
+    BotCommand(command="links", description="Связи во всех заметках"),
     BotCommand(command="llm", description="Состояние LLM-пула"),
     BotCommand(command="llm_reset", description="Сбросить лимиты LLM"),
 ]
@@ -107,9 +120,12 @@ HELP_TEXT = (
     "• ➕ Дописать — найдите заметку, выберите раздел, пришлите текст;\n"
     "• ✏️ Править раздел — заменить раздел целиком;\n"
     "• 🔎 Найти — показать заметку;\n"
+    "• 🔗 Связи во всех заметках — план и массовая простановка связей;\n"
     "• ⬅️ Назад — вернуться на первую страницу.\n\n"
+    "Связи появляются в разделе «Связи»: при создании заметки бот предлагает "
+    "их кнопкой, а в существующей — по просьбе «свяжи заметку…».\n\n"
     "Можно и обычными словами: «сохрани мысль…», «допиши в заметку про…».\n\n"
-    "Команды: /start, /help, /new, /llm — состояние моделей и лимитов."
+    "Команды: /start, /help, /new, /links, /llm — состояние моделей и лимитов."
 )
 
 
@@ -118,9 +134,11 @@ class PendingAction:
     """Предложение, которое ждёт решения пользователя."""
 
     proposal: Proposal
-    stage: str  # folder | auto | confirm | exists
+    stage: str  # folder | auto | confirm | exists | links
     path: str = ""
     folders: tuple[str, ...] = ()
+    links: tuple[str, ...] = ()
+    plan: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
 @dataclass
@@ -360,6 +378,20 @@ async def btn_note_find(message: Message, memory: ChatMemory) -> None:
     )
 
 
+@router.message(Command("links"))
+@router.message(F.text == BTN_LINKS)
+async def cmd_links(
+    message: Message,
+    memory: ChatMemory,
+    settings: Settings,
+    obsidian: ObsidianBackend,
+) -> None:
+    """Массовая простановка связей: план по всем заметкам (FR-06)."""
+    memory.clear_flow(message.chat.id)
+    memory.set_page(message.chat.id, "scenarios")
+    await _offer_bulk(message, memory, settings, obsidian)
+
+
 @router.message(F.text)
 async def answer_text(
     message: Message,
@@ -410,7 +442,7 @@ async def answer_text(
 
     if result.proposal is not None:
         memory.add(chat_id, text, _proposal_text(result.proposal))
-        await _offer(message, memory, settings, obsidian, result.proposal)
+        await _offer(message, agent, memory, settings, obsidian, result.proposal)
         return
 
     if result.clarify:
@@ -432,6 +464,7 @@ async def answer_text(
 
 async def _offer(
     message: Message,
+    agent: Agent,
     memory: ChatMemory,
     settings: Settings,
     obsidian: ObsidianBackend,
@@ -439,26 +472,244 @@ async def _offer(
 ) -> None:
     chat_id = message.chat.id
 
+    if proposal.kind == "bulk":
+        await _offer_bulk(message, memory, settings, obsidian)
+        return
+
+    if proposal.kind == "links":
+        links = tuple(await _proposal_links(agent, obsidian, proposal))
+        if not links:
+            memory.drop_action(chat_id)
+            await message.answer("Новых связей не нашёл: всё уже связано.")
+            return
+        if settings.agent_confirmation == "never":
+            memory.drop_action(chat_id)
+            await message.answer(
+                await _apply(obsidian, proposal, proposal.path, links)
+            )
+            return
+        sent = await message.answer(
+            _links_text(proposal.path, links), reply_markup=_links_keyboard()
+        )
+        memory.set_action(
+            chat_id,
+            PendingAction(proposal, "links", path=proposal.path, links=links),
+            sent.message_id,
+        )
+        return
+
+    links: tuple[str, ...] = ()
+    if settings.agent_auto_link:
+        links = tuple(await _proposal_links(agent, obsidian, proposal))
+
     if proposal.kind == "create":
         sent = await message.answer(
-            _proposal_text(proposal), reply_markup=_folder_keyboard(settings)
+            _proposal_text(proposal, links), reply_markup=_folder_keyboard(settings)
         )
-        memory.set_action(chat_id, PendingAction(proposal, "folder"), sent.message_id)
+        memory.set_action(
+            chat_id, PendingAction(proposal, "folder", links=links), sent.message_id
+        )
         return
 
     if _needs_confirm(settings, proposal.kind):
         sent = await message.answer(
-            _proposal_text(proposal), reply_markup=_confirm_keyboard()
+            _proposal_text(proposal, links), reply_markup=_confirm_keyboard()
         )
         memory.set_action(
             chat_id,
-            PendingAction(proposal, "confirm", path=proposal.path),
+            PendingAction(proposal, "confirm", path=proposal.path, links=links),
             sent.message_id,
         )
         return
 
     memory.drop_action(chat_id)
-    await message.answer(await _apply(obsidian, proposal, proposal.path))
+    await message.answer(await _apply(obsidian, proposal, proposal.path, links))
+
+
+async def _proposal_links(
+    agent: Agent, obsidian: ObsidianBackend, proposal: Proposal
+) -> list[str]:
+    """Кандидаты связей для предложения: создание, правка или готовая заметка."""
+    if proposal.kind == "create":
+        text = proposal.content
+        title = proposal.title
+        exclude = ""
+    else:
+        try:
+            current = await obsidian.read_note(proposal.path)
+        except (ObsidianError, aiohttp.ClientError) as error:
+            log.warning("Не удалось прочитать заметку для связей: %s", error)
+            return []
+        text = (
+            current
+            if proposal.kind == "links"
+            else f"{current}\n\n{proposal.content}"
+        )
+        title = proposal.path.rsplit("/", 1)[-1].removesuffix(".md")
+        exclude = proposal.path
+
+    try:
+        return await agent.suggest_links(text, title=title, exclude_path=exclude)
+    except (ObsidianError, aiohttp.ClientError) as error:
+        log.warning("Не удалось подобрать связи: %s", error)
+        return []
+
+
+async def _offer_bulk(
+    message: Message,
+    memory: ChatMemory,
+    settings: Settings,
+    obsidian: ObsidianBackend,
+) -> None:
+    """FR-06: план связей по всему хранилищу, подтверждение и отчёт."""
+    chat_id = message.chat.id
+    status = await message.answer("Сканирую хранилище и собираю план связей…")
+    try:
+        plan, errors, total, checked = await _bulk_plan(obsidian, settings)
+    except (ObsidianError, aiohttp.ClientError) as error:
+        await status.edit_text(_obsidian_error_text(error))
+        return
+
+    if not plan:
+        memory.drop_action(chat_id)
+        if errors:
+            await status.edit_text(
+                "Не удалось прочитать заметки:\n"
+                + "\n".join(f"• {error}" for error in errors[:BULK_LINK_EXAMPLES])
+            )
+        else:
+            await status.edit_text(
+                "Новых связей нет: в заметках не нашлось упоминаний других заметок."
+            )
+        return
+
+    text = _bulk_plan_text(plan, total, checked, errors)
+    if settings.agent_confirmation == "never":
+        memory.drop_action(chat_id)
+        await status.edit_text(f"{text}\n\n{await _apply_bulk(obsidian, plan)}")
+        return
+
+    await status.edit_text(f"{text}\n\nПрименить?", reply_markup=_bulk_keyboard())
+    memory.set_action(
+        chat_id,
+        PendingAction(Proposal(kind="bulk"), "confirm", plan=tuple(plan)),
+        status.message_id,
+    )
+
+
+async def _bulk_plan(
+    obsidian: ObsidianBackend, settings: Settings
+) -> tuple[list[tuple[str, tuple[str, ...]]], list[str], int, int]:
+    """Строит план: каким заметкам какие ссылки добавить (без записи).
+
+    Шаблоны и заметка стиля пропускаются: их содержимое копируется в новые
+    заметки, и связи в них стали бы частью шаблона.
+    """
+    notes = await obsidian.list_notes()
+    scanned = [
+        note
+        for note in notes[:BULK_LINK_NOTES]
+        if not _is_template_note(note, settings)
+    ]
+    duplicates = duplicate_titles(scanned)
+    plan: list[tuple[str, tuple[str, ...]]] = []
+    errors: list[str] = []
+
+    for path in scanned:
+        try:
+            text = await obsidian.read_note(path)
+        except (ObsidianError, aiohttp.ClientError) as error:
+            errors.append(f"{path}: {error}")
+            continue
+
+        linked = existing_links(text)
+        targets: list[str] = []
+        for candidate in mention_paths(text, scanned, exclude=path, strict=True):
+            label = link_label(candidate, duplicates)
+            if is_linked(label, linked) or label in targets:
+                continue
+            targets.append(label)
+            if len(targets) >= settings.agent_link_limit:
+                break
+        if targets:
+            plan.append((path, tuple(targets)))
+    return plan, errors, len(notes), len(scanned)
+
+
+def _is_template_note(path: str, settings: Settings) -> bool:
+    """Шаблоны и заметка стиля не участвуют в массовой простановке связей."""
+    value = path.strip("/").casefold()
+    style = settings.agent_style_note.strip("/").casefold()
+    if style and value == style:
+        return True
+    folder = settings.agent_template_folder.strip("/").casefold()
+    return bool(folder) and value.startswith(f"{folder}/")
+
+
+def _bulk_plan_text(
+    plan: list[tuple[str, tuple[str, ...]]],
+    total: int,
+    checked: int,
+    errors: list[str],
+) -> str:
+    """Сводка плана: сколько заметок, сколько ссылок, примеры."""
+    links_count = sum(len(targets) for _, targets in plan)
+    lines = [
+        "План связей:",
+        f"• заметок в хранилище — {total}",
+        f"• проверено — {checked}",
+        f"• изменятся — {len(plan)}",
+        f"• новых ссылок — {links_count}",
+    ]
+    if total > checked:
+        lines.append(f"• пропущено — {total - checked} (шаблоны или лимит)")
+    for path, targets in plan[:BULK_LINK_EXAMPLES]:
+        links = ", ".join(f"[[{target}]]" for target in targets)
+        lines.append(f"• {path}: {links}")
+    if len(plan) > BULK_LINK_EXAMPLES:
+        lines.append(f"… и ещё {len(plan) - BULK_LINK_EXAMPLES} заметок")
+    if errors:
+        lines.append("")
+        lines.append(f"Не прочитаны ({len(errors)}):")
+        lines.extend(f"• {error}" for error in errors[:BULK_LINK_EXAMPLES])
+    return "\n".join(lines)
+
+
+async def _apply_bulk(
+    obsidian: ObsidianBackend, plan: tuple[tuple[str, tuple[str, ...]], ...]
+) -> str:
+    """Применяет план по заметке за раз: ошибки собираются, удачные пишутся."""
+    changed = 0
+    added = 0
+    failed: list[str] = []
+    dry_run = False
+
+    for path, targets in plan:
+        try:
+            text = await obsidian.read_note(path)
+            updated = add_links(text, list(targets))
+            if updated == text:
+                continue
+            if await obsidian.write_note(path, updated, overwrite=True):
+                changed += 1
+                added += len(targets)
+            else:
+                dry_run = True
+        except (ObsidianError, aiohttp.ClientError) as error:
+            failed.append(f"{path}: {error}")
+
+    if dry_run:
+        links_count = sum(len(targets) for _, targets in plan)
+        return (
+            f"Dry-run: ничего не записано ({len(plan)} заметок, "
+            f"{links_count} ссылок в плане)."
+        )
+
+    lines = [f"Готово: изменено заметок — {changed}, добавлено ссылок — {added}."]
+    if failed:
+        lines.append(f"Не удалось ({len(failed)}):")
+        lines.extend(f"• {error}" for error in failed[:BULK_LINK_EXAMPLES])
+    return "\n".join(lines)
 
 
 def _flow_cancel_keyboard() -> InlineKeyboardMarkup:
@@ -511,6 +762,7 @@ async def _handle_flow(
             return
         await _offer(
             message,
+            agent,
             memory,
             settings,
             obsidian,
@@ -564,7 +816,7 @@ async def _handle_flow(
             )
             return
 
-        await _offer(message, memory, settings, obsidian, proposal)
+        await _offer(message, agent, memory, settings, obsidian, proposal)
         return
 
     await message.answer(
@@ -924,7 +1176,7 @@ async def on_yes(
         return
     memory.drop_action(callback.message.chat.id)
     await callback.message.edit_text(
-        await _apply(obsidian, action.proposal, action.path)
+        await _apply(obsidian, action.proposal, action.path, action.links)
     )
 
 
@@ -951,6 +1203,47 @@ async def on_append(
         kind="append", path=action.path, content=action.proposal.content
     )
     await callback.message.edit_text(await _apply(obsidian, proposal, action.path))
+
+
+@router.callback_query(F.data == "act:links:yes")
+async def on_links_yes(
+    callback: CallbackQuery, memory: ChatMemory, obsidian: ObsidianBackend
+) -> None:
+    """Подтверждение связей: запись с ними или без — одним действием."""
+    await callback.answer("Добавляю связи…")
+    action = await _pending(callback, memory)
+    if action is None:
+        return
+    memory.drop_action(callback.message.chat.id)
+    await callback.message.edit_text(
+        await _apply(obsidian, action.proposal, action.path, action.links)
+    )
+
+
+@router.callback_query(F.data == "act:links:no")
+async def on_links_no(
+    callback: CallbackQuery, memory: ChatMemory, obsidian: ObsidianBackend
+) -> None:
+    await callback.answer()
+    action = await _pending(callback, memory)
+    if action is None:
+        return
+    memory.drop_action(callback.message.chat.id)
+    await callback.message.edit_text(
+        await _apply(obsidian, action.proposal, action.path)
+    )
+
+
+@router.callback_query(F.data == "act:bulk:yes")
+async def on_bulk_yes(
+    callback: CallbackQuery, memory: ChatMemory, obsidian: ObsidianBackend
+) -> None:
+    await callback.answer("Проставляю связи…")
+    action = await _pending(callback, memory)
+    if action is None:
+        return
+    memory.drop_action(callback.message.chat.id)
+    await callback.message.edit_text(await _apply_bulk(obsidian, action.plan))
 
 
 async def _pending(callback: CallbackQuery, memory: ChatMemory) -> PendingAction | None:
@@ -1014,12 +1307,19 @@ async def _resolve_folder(
             else f"Создать заметку «{path}»?"
         )
         return Choice(
-            question,
+            question + _links_line(action.links),
             _confirm_keyboard(),
             replace(action, stage="confirm", path=path),
         )
 
-    return Choice(await _apply(obsidian, action.proposal, path))
+    if action.links and settings.agent_confirmation != "never":
+        return Choice(
+            _links_text(path, action.links),
+            _links_keyboard(),
+            replace(action, stage="links", path=path),
+        )
+
+    return Choice(await _apply(obsidian, action.proposal, path, action.links))
 
 
 async def _show_choice(
@@ -1034,20 +1334,37 @@ async def _show_choice(
 
 
 async def _apply(
-    obsidian: ObsidianBackend, proposal: Proposal, path: str
+    obsidian: ObsidianBackend,
+    proposal: Proposal,
+    path: str,
+    links: tuple[str, ...] = (),
 ) -> str:
     """Выполняет предложение и возвращает текст результата для пользователя."""
     if proposal.kind == "create":
+        content = add_links(proposal.content, list(links)) if links else proposal.content
         try:
-            written = await obsidian.write_note(path, proposal.content)
+            written = await obsidian.write_note(path, content)
         except (ObsidianError, aiohttp.ClientError) as error:
             return _obsidian_error_text(error)
         if written:
-            return f"Заметка создана: {path}"
+            return f"Заметка создана: {path}{_links_line(links)}"
         return (
             f"Dry-run: заметка «{path}» не записана. "
             "Включите OBSIDIAN_DRY_RUN=false для реальной записи."
         )
+
+    if proposal.kind == "links":
+        try:
+            current = await obsidian.read_note(path)
+            updated = add_links(current, list(links))
+            if updated == current:
+                return "Новых связей нет: всё уже связано."
+            written = await obsidian.write_note(path, updated, overwrite=True)
+        except (ObsidianError, aiohttp.ClientError) as error:
+            return _obsidian_error_text(error)
+        if written:
+            return f"Связи добавлены: {path}{_links_line(links)}"
+        return f"Dry-run: связи в «{path}» не записаны."
 
     try:
         current = await obsidian.read_note(path)
@@ -1064,6 +1381,8 @@ async def _apply(
             updated = replace_section(current, proposal.heading, proposal.content)
         else:
             updated = append_to_section(current, proposal.heading, proposal.content)
+        if links:
+            updated = add_links(updated, list(links))
         written = await obsidian.write_note(path, updated, overwrite=True)
     except ValueError as error:
         return f"Не удалось изменить заметку: {error}."
@@ -1071,7 +1390,7 @@ async def _apply(
         return _obsidian_error_text(error)
 
     if written:
-        return f"Изменения сохранены: {path}"
+        return f"Изменения сохранены: {path}{_links_line(links)}"
     return f"Dry-run: изменения в «{path}» не записаны."
 
 
@@ -1090,11 +1409,12 @@ def _preview(text: str) -> str:
     return text[:PREVIEW_CHARS] + "…"
 
 
-def _proposal_text(proposal: Proposal) -> str:
+def _proposal_text(proposal: Proposal, links: tuple[str, ...] = ()) -> str:
+    hint = _links_line(links)
     if proposal.kind == "create":
         return (
             f"Предлагаю заметку «{proposal.title}»:\n\n"
-            f"{_preview(proposal.content)}\n\nКуда сохранить?"
+            f"{_preview(proposal.content)}{hint}\n\nКуда сохранить?"
         )
     if proposal.kind == "append":
         where = (
@@ -1102,12 +1422,28 @@ def _proposal_text(proposal: Proposal) -> str:
             if proposal.heading
             else f"конец заметки «{proposal.path}»"
         )
-        return f"Дописать в {where}:\n\n{_preview(proposal.content)}\n\nПодтвердить?"
+        return (
+            f"Дописать в {where}:\n\n{_preview(proposal.content)}{hint}"
+            "\n\nПодтвердить?"
+        )
     verb = "Заменить" if proposal.mode == "replace" else "Дополнить"
     return (
         f"{verb} раздел «{proposal.heading}» в «{proposal.path}»:\n\n"
-        f"{_preview(proposal.content)}\n\nПодтвердить?"
+        f"{_preview(proposal.content)}{hint}\n\nПодтвердить?"
     )
+
+
+def _links_line(links: tuple[str, ...]) -> str:
+    """Одна строка со ссылками — для превью и для отчёта о записи."""
+    if not links:
+        return ""
+    return "\n\nСвязи: " + ", ".join(f"[[{link}]]" for link in links)
+
+
+def _links_text(path: str, links: tuple[str, ...]) -> str:
+    """Список предложенных связей перед записью."""
+    lines = "\n".join(f"- [[{link}]]" for link in links)
+    return f"Связи для «{path}»:\n\n{lines}\n\nДобавить их в раздел «Связи»?"
 
 
 def _folder_keyboard(settings: Settings) -> InlineKeyboardMarkup:
@@ -1163,6 +1499,29 @@ def _append_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="Дописать", callback_data="act:append"),
+                InlineKeyboardButton(text="Отмена", callback_data="act:no"),
+            ]
+        ]
+    )
+
+
+def _links_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Добавить связи", callback_data="act:links:yes"),
+                InlineKeyboardButton(text="Без связей", callback_data="act:links:no"),
+            ],
+            [InlineKeyboardButton(text="Отмена", callback_data="act:no")],
+        ]
+    )
+
+
+def _bulk_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Применить", callback_data="act:bulk:yes"),
                 InlineKeyboardButton(text="Отмена", callback_data="act:no"),
             ]
         ]

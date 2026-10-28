@@ -10,6 +10,14 @@ from typing import Any
 
 from app.actions import prompt_block, tools as build_tools, write_actions
 from app.config import Settings
+from app.links import (
+    duplicate_titles,
+    existing_links,
+    is_linked,
+    link_label,
+    mention_paths,
+    note_title,
+)
 from app.llm import ChatClient, LLMError, ToolCall
 from app.notes import slugify, validate_path
 from app.obsidian import ObsidianBackend, ObsidianError
@@ -20,6 +28,8 @@ log = logging.getLogger(__name__)
 MAX_STEPS = 6
 MAX_NOTE_CHARS = 4000
 MAX_SUGGESTED_FOLDERS = 3
+MAX_LINK_CANDIDATES = 20
+LINK_FALLBACK_CHOICES = 3
 
 BASE_PROMPT = (
     "Ты живой и дружелюбный помощник в Telegram. Работаешь с хранилищем Obsidian "
@@ -132,6 +142,15 @@ FOLDER_PROMPT = (
 )
 
 
+LINK_PROMPT = (
+    "Выбери, с какими существующими заметками связать эту заметку.\n\n"
+    "Заметка «{title}»:\n{content}\n\n"
+    "Кандидаты:\n{candidates}\n\n"
+    "Выбери до {limit} самых релевантных. Ответь только путями из списка, "
+    "каждый с новой строки, без пояснений. Если ничего не подходит — ответь «нет»."
+)
+
+
 @dataclass(frozen=True)
 class Proposal:
     """Изменение, которое ждёт решения пользователя."""
@@ -169,6 +188,7 @@ class Agent:
         self._search_limit = settings.agent_search_limit
         self._template_folder = settings.agent_template_folder
         self._style_note = settings.agent_style_note
+        self._link_limit = settings.agent_link_limit
         self._style = style.strip()[:4000]
         self.system_prompt = build_system_prompt(self._style)
 
@@ -241,6 +261,91 @@ class Agent:
             if len(result) >= MAX_SUGGESTED_FOLDERS:
                 break
         return result
+
+    async def suggest_links(
+        self, text: str, *, title: str = "", exclude_path: str = ""
+    ) -> list[str]:
+        """Подбирает связи для заметки (FR-05): упоминания, поиск и модель.
+
+        Возвращает готовые строки для `[[...]]` (имя или путь), исключая то,
+        что в заметке уже связано. Пустой список — предлагать нечего.
+        Автолинковку включает `AGENT_AUTO_LINK`; ручная команда вызывает
+        этот метод независимо от настройки.
+        """
+        if self._obsidian is None:
+            return []
+
+        try:
+            notes = await self._obsidian.list_notes()
+        except ObsidianError as error:
+            log.warning("Не удалось получить список заметок для связей: %s", error)
+            return []
+        if not notes:
+            return []
+
+        duplicates = duplicate_titles(notes)
+        linked = existing_links(text)
+        candidates = await self._link_candidates(text, title, exclude_path, notes)
+        candidates = [
+            (path, excerpt)
+            for path, excerpt in candidates
+            if not is_linked(link_label(path, duplicates), linked)
+        ][:MAX_LINK_CANDIDATES]
+        if not candidates:
+            return []
+
+        prompt = LINK_PROMPT.format(
+            title=title or "Без названия",
+            content=text[:1500],
+            candidates="\n".join(
+                f"- {path}: {excerpt}" if excerpt else f"- {path}"
+                for path, excerpt in candidates
+            ),
+            limit=self._link_limit,
+        )
+        try:
+            response = await self._llm.chat(
+                [{"role": "user", "content": prompt}], max_tokens=200
+            )
+        except LLMError as error:
+            log.warning("Модель не выбрала связи (%s), беру упоминания", error)
+            fallback = candidates[: min(LINK_FALLBACK_CHOICES, self._link_limit)]
+            return [link_label(path, duplicates) for path, _ in fallback]
+
+        chosen = _pick_paths(response.text, candidates, self._link_limit)
+        return [link_label(path, duplicates) for path in chosen]
+
+    async def _link_candidates(
+        self, text: str, title: str, exclude_path: str, notes: list[str]
+    ) -> list[tuple[str, str]]:
+        """Кандидаты (путь, фрагмент): упоминания названий и полнотекстовый поиск.
+
+        Упоминания дают точные совпадения имён, поиск — совпадения по тексту,
+        алиасам и тегам (их ищет хранилище, а не бот).
+        """
+        found: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for path in mention_paths(text, notes, exclude=exclude_path):
+            seen.add(path)
+            found.append((path, ""))
+
+        query = title.strip() or " ".join(text.split()[:8])
+        if not query:
+            return found
+        try:
+            hits = await self._obsidian.search_notes(query, limit=self._search_limit)
+        except ObsidianError as error:
+            log.warning("Поиск кандидатов для связей не удался: %s", error)
+            return found
+
+        excluded = exclude_path.strip("/").casefold()
+        for hit in hits:
+            path = hit.get("path", "")
+            if not path or path.strip("/").casefold() == excluded or path in seen:
+                continue
+            seen.add(path)
+            found.append((path, (hit.get("excerpt") or "").strip()[:160]))
+        return found
 
     async def compose_note(self, text: str, template: str = "") -> tuple[str, str]:
         """Разворачивает сообщение в заметку: (заголовок, полный текст).
@@ -318,12 +423,19 @@ class Agent:
                 text="", proposal=Proposal(kind="create", title=title, content=content)
             )
 
+        if call.name == "link_all":
+            log.info("Предложение проставить связи во всех заметках")
+            return AgentResult(text="", proposal=Proposal(kind="bulk"))
+
         path = _argument(call.arguments, "path")
         content = _argument(call.arguments, "content", strip=False)
         try:
             path = validate_path(path)
         except ValueError as error:
             return AgentResult(text=f"Некорректный путь заметки: {error}.")
+        if call.name == "add_links":
+            log.info("Предложение связать заметку: %s", path)
+            return AgentResult(text="", proposal=Proposal(kind="links", path=path))
         if not content.strip():
             return AgentResult(text="Модель предложила пустое изменение.")
 
@@ -454,6 +566,33 @@ def _clean_folder_line(line: str) -> str:
     if text.lower() in ("нет", "none", "no", "-"):
         return ""
     return text
+
+
+def _pick_paths(
+    answer: str, candidates: list[tuple[str, str]], limit: int
+) -> list[str]:
+    """Выбирает пути из ответа модели: по пути или по имени, без повторов.
+
+    Незнакомые строки и «нет» игнорируются: модель может выбрать только
+    из предложенных кандидатов, иначе появится ссылка на несуществующую заметку.
+    """
+    known = {
+        path.casefold().removesuffix(".md"): path for path, _ in candidates
+    }
+    by_name = {note_title(path).casefold(): path for path, _ in candidates}
+    chosen: list[str] = []
+    for line in answer.splitlines():
+        value = _clean_folder_line(line)
+        if not value:
+            continue
+        key = value.casefold().removesuffix(".md")
+        path = known.get(key) or by_name.get(key)
+        if path is None or path in chosen:
+            continue
+        chosen.append(path)
+        if len(chosen) >= limit:
+            break
+    return chosen
 
 
 def _clean_folder_path(name: str) -> str:

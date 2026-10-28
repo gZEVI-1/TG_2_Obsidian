@@ -25,6 +25,9 @@ DEFAULT_LLM_STUB_ACCOUNTS = 3
 DEFAULT_LLM_STUB_QUOTA = 2
 DEFAULT_LLM_STUB_RESET_SECONDS = 60
 
+DEFAULT_LINK_LIMIT = 10
+MAX_LINK_LIMIT = 50
+
 # Порядок = качество: первая модель лучшая, последняя — запасная.
 # Список используется только в режиме заглушек, пока нет реальных API.
 DEFAULT_STUB_MODELS = (
@@ -78,6 +81,8 @@ class Settings:
     obsidian_vault_path: str = ""
     agent_template_folder: str = "Templates"
     agent_style_note: str = ""
+    agent_auto_link: bool = True
+    agent_link_limit: int = DEFAULT_LINK_LIMIT
 
     @property
     def effective_obsidian_mode(self) -> str:
@@ -126,6 +131,8 @@ class Settings:
             "agent_search_limit": str(self.agent_search_limit),
             "agent_template_folder": self.agent_template_folder,
             "agent_style_note": self.agent_style_note or "<не задан>",
+            "agent_auto_link": str(self.agent_auto_link).lower(),
+            "agent_link_limit": str(self.agent_link_limit),
             "log_level": self.log_level,
         }
 
@@ -364,4 +371,11 @@ def load_settings() -> Settings:
         obsidian_vault_path=obsidian_vault_path,
         agent_template_folder=_env_folder("AGENT_TEMPLATE_FOLDER", "Templates"),
         agent_style_note=_env_note_path("AGENT_STYLE_NOTE"),
+        agent_auto_link=_env_bool("AGENT_AUTO_LINK", default=True),
+        agent_link_limit=_env_int(
+            "AGENT_LINK_LIMIT",
+            default=DEFAULT_LINK_LIMIT,
+            minimum=1,
+            maximum=MAX_LINK_LIMIT,
+        ),
     )
