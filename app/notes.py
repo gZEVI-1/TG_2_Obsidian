@@ -163,6 +163,72 @@ def append_to_note(text: str, body: str) -> str:
     return f"{_join_blocks(base, block)}\n" if base else f"{block}\n"
 
 
+def create_section(text: str, heading: str, body: str = "", level: int = 2) -> str:
+    """Добавляет новый раздел в конец заметки (FR-03).
+
+    Заголовок не должен уже существовать: иначе получится дубль, и правка
+    раздела по имени станет неоднозначной. Frontmatter и остальные разделы
+    сохраняются.
+    """
+    title = heading.strip().lstrip("#").strip()
+    if not title:
+        raise ValueError("не указан заголовок раздела")
+    if level < 1 or level > 6:
+        raise ValueError("уровень раздела — от 1 до 6")
+    if any(existing.casefold() == title.casefold() for existing in sections(text)):
+        raise ValueError(f"раздел «{title}» уже существует")
+
+    block = f"{'#' * level} {title}"
+    body = body.strip("\n")
+    if body:
+        block = f"{block}\n\n{body}"
+    base = text.rstrip("\n")
+    return f"{base}\n\n{block}\n" if base else f"{block}\n"
+
+
+def validate_folder(folder: str) -> str:
+    """Проверяет путь папки: без выхода вверх и служебных каталогов."""
+    value = folder.strip().replace("\\", "/").strip("/")
+    if not value:
+        raise ValueError("путь папки пуст")
+    if len(value) > MAX_PATH_LENGTH:
+        raise ValueError(f"путь папки длиннее {MAX_PATH_LENGTH} символов")
+
+    for part in value.split("/"):
+        if not part.strip():
+            raise ValueError("в пути папки есть пустой сегмент")
+        if part in (".", ".."):
+            raise ValueError("в пути папки есть «.» или «..»")
+        if part.startswith("."):
+            raise ValueError(f"служебная папка «{part}»")
+        if any(char in part for char in FORBIDDEN_PATH_CHARS):
+            raise ValueError(f"недопустимый символ в «{part}»")
+    return value
+
+
+def destination_path(source: str, destination: str) -> str:
+    """Куда переносить/копировать заметку.
+
+    Полный путь с «.md» принимается как есть; иначе это папка, и имя файла
+    сохраняется. Путь не может совпадать с исходным.
+    """
+    source = validate_path(source)
+    raw = destination.strip().replace("\\", "/").strip("/")
+    if not raw:
+        raise ValueError("не указано, куда перенести заметку")
+
+    if raw.lower().endswith(".md"):
+        target = validate_path(raw)
+    else:
+        folder = validate_folder(raw)
+        name = source.rsplit("/", 1)[-1]
+        target = validate_path(f"{folder}/{name}" if folder else name)
+
+    if target == source:
+        raise ValueError("новый путь совпадает со старым")
+    return target
+
+
 _LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
 
 

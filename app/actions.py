@@ -46,10 +46,28 @@ ACTIONS: tuple[Action, ...] = (
         },
     ),
     Action(
+        name="list_notes",
+        title="Заметки в папке",
+        hint="когда нужно посмотреть, какие заметки лежат в папке",
+        description=(
+            "Показать заметки хранилища. folder — папка, если нужно только её "
+            "содержимое; пусто — все заметки."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "folder": {
+                    "type": "string",
+                    "description": "Папка относительно корня; пусто — всё хранилище",
+                }
+            },
+        },
+    ),
+    Action(
         name="list_folders",
         title="Папки хранилища",
-        hint="когда нужно понять, куда положить новую заметку",
-        description="Показать папки хранилища Obsidian.",
+        hint="когда нужно посмотреть папки или понять, куда положить заметку",
+        description="Показать папки хранилища Obsidian, включая пустые.",
         parameters={"type": "object", "properties": {}},
     ),
     Action(
@@ -155,6 +173,156 @@ ACTIONS: tuple[Action, ...] = (
                 },
             },
             "required": ["path", "heading", "content", "mode"],
+        },
+        writes=True,
+    ),
+    Action(
+        name="create_section",
+        title="Создать раздел",
+        hint="когда в заметке нужен новый раздел с заголовком",
+        description=(
+            "Добавить новый раздел в конец существующей заметки. heading — "
+            "заголовок без решёток, content — текст раздела (может быть пустым). "
+            "Если такой раздел уже есть, бот откажется создавать дубль. Сначала "
+            "прочитай заметку, чтобы не дублировать существующие разделы."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Путь существующей заметки"},
+                "heading": {
+                    "type": "string",
+                    "description": "Заголовок нового раздела",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Текст раздела в Markdown",
+                },
+                "level": {
+                    "type": "integer",
+                    "description": "Уровень заголовка 1–6, по умолчанию 2 (##)",
+                },
+            },
+            "required": ["path", "heading"],
+        },
+        writes=True,
+    ),
+    Action(
+        name="create_folder",
+        title="Создать папку",
+        hint="когда просят завести новую папку в хранилище",
+        description=(
+            "Создать папку по пути относительно корня хранилища, например "
+            "«Проекты/2026». Не используй служебные папки с точкой."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "folder": {
+                    "type": "string",
+                    "description": (
+                        "Путь новой папки, например «Люди» или «Проекты/2026»"
+                    ),
+                }
+            },
+            "required": ["folder"],
+        },
+        writes=True,
+    ),
+    Action(
+        name="rename_folder",
+        title="Переименовать папку",
+        hint="когда просят переименовать или перенести папку",
+        description=(
+            "Переименовать папку или перенести её в другое место. path — текущий "
+            "путь папки, new_path — новый путь. Содержимое папки сохраняется."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Текущий путь папки"},
+                "new_path": {"type": "string", "description": "Новый путь папки"},
+            },
+            "required": ["path", "new_path"],
+        },
+        writes=True,
+    ),
+    Action(
+        name="delete_folder",
+        title="Удалить папку",
+        hint="когда просят удалить папку вместе с содержимым",
+        description=(
+            "Удалить папку со всем содержимым. Бот покажет подтверждение; "
+            "в файловом режиме папка перемещается в `.trash`."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "folder": {"type": "string", "description": "Путь папки"}
+            },
+            "required": ["folder"],
+        },
+        writes=True,
+    ),
+    Action(
+        name="move_note",
+        title="Переместить заметку",
+        hint="когда просят перенести заметку в другую папку или переименовать",
+        description=(
+            "Переместить или переименовать заметку. path — текущий путь, "
+            "destination — полный новый путь с «.md» либо папка (тогда имя файла "
+            "сохраняется). Сначала найди точный путь через search_notes."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Текущий путь заметки"},
+                "destination": {
+                    "type": "string",
+                    "description": "Новый путь с .md или папка назначения",
+                },
+            },
+            "required": ["path", "destination"],
+        },
+        writes=True,
+    ),
+    Action(
+        name="copy_note",
+        title="Скопировать заметку",
+        hint="когда просят сделать копию заметки",
+        description=(
+            "Скопировать заметку. path — исходный путь, destination — полный "
+            "новый путь с «.md» либо папка (тогда имя файла сохраняется). "
+            "Существующий файл не перезаписывается."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Путь исходной заметки"},
+                "destination": {
+                    "type": "string",
+                    "description": "Новый путь с .md или папка назначения",
+                },
+            },
+            "required": ["path", "destination"],
+        },
+        writes=True,
+    ),
+    Action(
+        name="delete_note",
+        title="Удалить заметку",
+        hint="когда просят удалить заметку",
+        description=(
+            "Удалить заметку. Бот покажет подтверждение; в файловом режиме "
+            "заметка перемещается в `.trash`, в REST-режиме — в корзину Obsidian. "
+            "Сначала найди точный путь через search_notes."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Путь заметки"}
+            },
+            "required": ["path"],
         },
         writes=True,
     ),

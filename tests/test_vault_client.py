@@ -114,6 +114,94 @@ class VaultClientTests(unittest.TestCase):
         hidden = self.run_async(client.search("Служебное", limit=5))
         self.assertEqual(hidden, [])
 
+    def test_search_by_content_ignores_quotes_and_command_words(self) -> None:
+        client = VaultClient(make_settings(self.vault))
+        hits = self.run_async(
+            client.search_notes('Найди "сроки бюджет"', limit=5)
+        )
+        self.assertEqual([hit["path"] for hit in hits], ["Projects/Альфа.md"])
+        self.assertEqual(hits[0]["match"], "текст")
+        self.assertIn("бюджет", hits[0]["excerpt"].lower())
+
+    def test_search_by_content_any_word_order(self) -> None:
+        client = VaultClient(make_settings(self.vault))
+        hits = self.run_async(client.search_notes("проекта бюджет", limit=5))
+        self.assertEqual([hit["path"] for hit in hits], ["Projects/Альфа.md"])
+
+    def test_search_by_partial_word(self) -> None:
+        client = VaultClient(make_settings(self.vault))
+        hits = self.run_async(client.search_notes("бюдж", limit=5))
+        self.assertEqual([hit["path"] for hit in hits], ["Projects/Альфа.md"])
+
+    def test_manages_folders(self) -> None:
+        client = VaultClient(make_settings(self.vault))
+        self.assertTrue(self.run_async(client.create_folder("Projects/2026")))
+        self.assertIn("Projects/2026", self.run_async(client.list_folders()))
+
+        self.assertTrue(
+            self.run_async(client.rename_folder("Projects/2026", "Projects/2027"))
+        )
+        self.assertFalse((self.vault / "Projects" / "2026").exists())
+        self.assertTrue((self.vault / "Projects" / "2027").is_dir())
+
+        self.assertTrue(self.run_async(client.delete_folder("Projects/2027")))
+        self.assertFalse((self.vault / "Projects" / "2027").exists())
+        self.assertTrue((self.vault / ".trash" / "Projects" / "2027").is_dir())
+
+    def test_refuses_existing_folder(self) -> None:
+        client = VaultClient(make_settings(self.vault))
+        with self.assertRaises(ObsidianError) as caught:
+            self.run_async(client.create_folder("Projects"))
+        self.assertEqual(caught.exception.status, 409)
+
+    def test_copies_moves_and_deletes_note(self) -> None:
+        client = VaultClient(make_settings(self.vault))
+        source = "Projects/Альфа.md"
+        copy_path = "Projects/Альфа-копия.md"
+
+        self.assertTrue(self.run_async(client.copy_note(source, copy_path)))
+        self.assertEqual(
+            (self.vault / copy_path).read_text(encoding="utf-8"),
+            (self.vault / source).read_text(encoding="utf-8"),
+        )
+
+        moved_path = "Inbox/Альфа-копия.md"
+        self.assertTrue(self.run_async(client.move_note(copy_path, moved_path)))
+        self.assertFalse((self.vault / copy_path).exists())
+        self.assertTrue((self.vault / moved_path).is_file())
+
+        self.assertTrue(self.run_async(client.delete_note(moved_path)))
+        self.assertFalse((self.vault / moved_path).exists())
+        self.assertTrue((self.vault / ".trash" / moved_path).is_file())
+        self.assertTrue((self.vault / source).is_file())
+
+    def test_note_operations_do_not_overwrite(self) -> None:
+        client = VaultClient(make_settings(self.vault))
+        with self.assertRaises(ObsidianError) as caught:
+            self.run_async(client.copy_note("Projects/Альфа.md", "Inbox.md"))
+        self.assertEqual(caught.exception.status, 409)
+
+    def test_dry_run_skips_folder_and_note_operations(self) -> None:
+        client = VaultClient(make_settings(self.vault, dry_run=True))
+        self.assertFalse(self.run_async(client.create_folder("Архив")))
+        self.assertFalse((self.vault / "Архив").exists())
+        self.assertFalse(
+            self.run_async(client.delete_note("Projects/Альфа.md"))
+        )
+        self.assertTrue((self.vault / "Projects" / "Альфа.md").exists())
+        self.assertFalse(
+            self.run_async(
+                client.move_note("Projects/Альфа.md", "Архив/Альфа.md")
+            )
+        )
+        self.assertTrue((self.vault / "Projects" / "Альфа.md").exists())
+
+    def test_lists_folders_without_service_directories(self) -> None:
+        client = VaultClient(make_settings(self.vault))
+        folders = self.run_async(client.list_folders())
+        self.assertEqual(folders, ["Projects"])
+        self.assertNotIn(".obsidian", folders)
+
     def test_path_outside_vault_is_rejected(self) -> None:
         client = VaultClient(make_settings(self.vault))
         with self.assertRaises(ObsidianError):

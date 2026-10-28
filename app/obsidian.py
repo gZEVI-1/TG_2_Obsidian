@@ -11,7 +11,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import tempfile
+import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
@@ -20,7 +22,8 @@ from urllib.parse import quote
 import aiohttp
 
 from app.config import Settings
-from app.search import rank
+from app.notes import validate_folder, validate_path
+from app.search import content_score, excerpt, query_terms, rank
 
 log = logging.getLogger(__name__)
 
@@ -69,6 +72,34 @@ class ObsidianBackend(ABC):
         """Все .md-файлы хранилища, рекурсивно; глубина и число ограничены."""
 
     @abstractmethod
+    async def list_folders(self) -> list[str]:
+        """Все папки хранилища, рекурсивно, без служебных каталогов."""
+
+    @abstractmethod
+    async def create_folder(self, folder: str) -> bool:
+        """Создаёт папку. True — папка реально создана."""
+
+    @abstractmethod
+    async def rename_folder(self, folder: str, new_path: str) -> bool:
+        """Переименовывает или перемещает папку. True — изменения записаны."""
+
+    @abstractmethod
+    async def delete_folder(self, folder: str) -> bool:
+        """Удаляет папку со всем содержимым (по возможности — в корзину)."""
+
+    @abstractmethod
+    async def delete_note(self, path: str) -> bool:
+        """Удаляет заметку (по возможности — в корзину)."""
+
+    @abstractmethod
+    async def copy_note(self, source: str, destination: str) -> bool:
+        """Копирует заметку. True — копия создана."""
+
+    @abstractmethod
+    async def move_note(self, source: str, destination: str) -> bool:
+        """Перемещает или переименовывает заметку. True — файл перемещён."""
+
+    @abstractmethod
     async def folder_exists(self, folder: str) -> bool:
         """Проверяет, существует ли папка в хранилище."""
 
@@ -96,6 +127,7 @@ class ObsidianBackend(ABC):
         if not query.strip():
             return []
 
+        needle = " ".join(query_terms(query))
         hits: list[dict[str, str]] = []
         seen: set[str] = set()
 
@@ -120,9 +152,9 @@ class ObsidianBackend(ABC):
             if len(hits) >= limit:
                 return hits[:limit]
 
-        if len(hits) < limit:
+        if len(hits) < limit and needle:
             try:
-                raw = await self.search(query, limit=limit * 2)
+                raw = await self.search(needle, limit=limit * 2)
             except (ObsidianError, aiohttp.ClientError):
                 raw = []
 
@@ -183,10 +215,13 @@ class ObsidianClient(ObsidianBackend):
 
     async def search(self, query: str, limit: int) -> list[dict[str, Any]]:
         """Полнотекстовый поиск по хранилищу (FR-09)."""
+        needle = " ".join(query_terms(query))
+        if not needle:
+            return []
         session = await self._ensure_session()
         async with session.post(
             f"{self._base_url}/search/simple/",
-            params={"query": query, "contextLength": 80},
+            params={"query": needle, "contextLength": 80},
         ) as response:
             if response.status != 200:
                 raise ObsidianError(
@@ -225,6 +260,181 @@ class ObsidianClient(ObsidianBackend):
                 out.append(f"{folder}/{entry}".strip("/"))
             if len(out) >= MAX_LISTED_NOTES:
                 return
+
+    async def list_folders(self) -> list[str]:
+        """Все папки хранилища, рекурсивно, без служебных каталогов."""
+        folders: list[str] = []
+        await self._collect_folders("", 0, folders)
+        return sorted(folders)
+
+    async def _collect_folders(
+        self, folder: str, depth: int, out: list[str]
+    ) -> None:
+        if depth > MAX_DEPTH or len(out) >= MAX_LISTED_NOTES:
+            return
+
+        url = f"{self._base_url}/vault/" + (
+            quote(folder, safe="/") + "/" if folder else ""
+        )
+        session = await self._ensure_session()
+        async with session.get(url, headers={"Accept": "application/json"}) as response:
+            if response.status == 404:
+                return
+            if response.status != 200:
+                raise ObsidianError(
+                    f"GET /vault/{folder}: HTTP {response.status}", response.status
+                )
+            data = await response.json(content_type=None)
+
+        for entry in data.get("files", []):
+            if not entry.endswith("/"):
+                continue
+            name = entry.rstrip("/")
+            if name.startswith(".") or name in IGNORED_DIRS:
+                continue
+            path = f"{folder}/{name}".strip("/")
+            out.append(path)
+            await self._collect_folders(path, depth + 1, out)
+            if len(out) >= MAX_LISTED_NOTES:
+                return
+
+    async def create_folder(self, folder: str) -> bool:
+        """Создаёт папку. В REST-режиме — пустой служебный файл `.keep`."""
+        folder = validate_folder(folder)
+        if self._dry_run:
+            log.info("[dry-run] создание папки %s пропущено", folder)
+            return False
+        if await self.folder_exists(folder):
+            raise ObsidianError(f"Папка уже существует: {folder}", 409)
+
+        session = await self._ensure_session()
+        async with session.put(
+            self._note_url(f"{folder}/.keep"),
+            data=b"",
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        ) as response:
+            if response.status not in (200, 201, 204):
+                raise ObsidianError(
+                    f"PUT /vault/{folder}/.keep: HTTP {response.status}",
+                    response.status,
+                )
+        log.info("Папка создана: %s", folder)
+        return True
+
+    async def rename_folder(self, folder: str, new_path: str) -> bool:
+        """Переименовывает папку переносом всех её заметок.
+
+        REST API не умеет переименовывать каталоги, поэтому файлы переносятся
+        по одному; пустые подпапки в старом месте могут остаться.
+        """
+        folder = validate_folder(folder)
+        new_path = validate_folder(new_path)
+        if folder == new_path:
+            raise ObsidianError("Новый путь папки совпадает со старым.", 400)
+        if self._dry_run:
+            log.info("[dry-run] переименование папки %s пропущено", folder)
+            return False
+        if not await self.folder_exists(folder):
+            raise ObsidianError(f"Папка не найдена: {folder}", 404)
+        if await self.folder_exists(new_path):
+            raise ObsidianError(f"Папка уже существует: {new_path}", 409)
+
+        prefix = f"{folder}/"
+        notes = [
+            note for note in await self.list_notes() if note.startswith(prefix)
+        ]
+        keep_moved = False
+        try:
+            await self._transfer("MOVE", f"{folder}/.keep", f"{new_path}/.keep")
+            keep_moved = True
+        except ObsidianError as error:
+            if error.status != 404:
+                raise
+        for note in notes:
+            relative = note[len(prefix) :]
+            await self.move_note(note, f"{new_path}/{relative}")
+        if not notes and not keep_moved:
+            await self.create_folder(new_path)
+        return True
+
+    async def delete_folder(self, folder: str) -> bool:
+        """Удаляет заметки папки в корзину Obsidian.
+
+        Сам каталог через REST API удалить нельзя: после очистки он может
+        остаться пустым.
+        """
+        folder = validate_folder(folder)
+        if self._dry_run:
+            log.info("[dry-run] удаление папки %s пропущено", folder)
+            return False
+        if not await self.folder_exists(folder):
+            raise ObsidianError(f"Папка не найдена: {folder}", 404)
+
+        prefix = f"{folder}/"
+        notes = [
+            note for note in await self.list_notes() if note.startswith(prefix)
+        ]
+        for note in notes:
+            await self.delete_note(note)
+        await self._delete_file(f"{folder}/.keep", missing_ok=True)
+        return True
+
+    async def _delete_file(self, path: str, *, missing_ok: bool = False) -> bool:
+        session = await self._ensure_session()
+        async with session.delete(self._note_url(path)) as response:
+            if response.status in (200, 204):
+                return True
+            if response.status == 404:
+                if missing_ok:
+                    return False
+                raise ObsidianError(f"Файл не найден: {path}", 404)
+            raise ObsidianError(
+                f"DELETE {path}: HTTP {response.status}", response.status
+            )
+
+    async def delete_note(self, path: str) -> bool:
+        """Удаляет заметку; Obsidian по умолчанию перемещает её в корзину."""
+        path = validate_path(path)
+        if self._dry_run:
+            log.info("[dry-run] удаление заметки %s пропущено", path)
+            return False
+        return await self._delete_file(path)
+
+    async def _transfer(self, method: str, source: str, destination: str) -> bool:
+        if source == destination:
+            raise ObsidianError("Новый путь совпадает со старым.", 400)
+        session = await self._ensure_session()
+        headers = {"Destination": quote(destination, safe="/")}
+        async with session.request(
+            method, self._note_url(source), headers=headers
+        ) as response:
+            if response.status in (200, 204):
+                return True
+            if response.status == 404:
+                raise ObsidianError(f"Заметка не найдена: {source}", 404)
+            if response.status == 409:
+                raise ObsidianError(
+                    f"Объект уже существует: {destination}", 409
+                )
+            raise ObsidianError(
+                f"{method} {source}: HTTP {response.status}", response.status
+            )
+
+    async def copy_note(self, source: str, destination: str) -> bool:
+        source = validate_path(source)
+        destination = validate_path(destination)
+        if self._dry_run:
+            log.info("[dry-run] копирование %s → %s пропущено", source, destination)
+            return False
+        return await self._transfer("COPY", source, destination)
+
+    async def move_note(self, source: str, destination: str) -> bool:
+        source = validate_path(source)
+        destination = validate_path(destination)
+        if self._dry_run:
+            log.info("[dry-run] перенос %s → %s пропущен", source, destination)
+            return False
+        return await self._transfer("MOVE", source, destination)
 
     async def folder_exists(self, folder: str) -> bool:
         """Проверяет, существует ли папка в хранилище."""
@@ -384,6 +594,187 @@ class VaultClient(ObsidianBackend):
     async def list_notes(self) -> list[str]:
         return await self._call(self._scan_notes)
 
+    def _scan_folders(self) -> list[str]:
+        """Рекурсивный обход папок без служебных каталогов."""
+        folders: list[str] = []
+
+        def walk(folder: Path, depth: int) -> None:
+            if depth > MAX_DEPTH or len(folders) >= MAX_LISTED_NOTES:
+                return
+            try:
+                entries = sorted(folder.iterdir(), key=lambda item: item.name.lower())
+            except OSError as error:
+                raise ObsidianError(
+                    f"Не удалось прочитать {folder}: {error}"
+                ) from error
+
+            for entry in entries:
+                if entry.is_symlink() or not entry.is_dir():
+                    continue
+                if entry.name.startswith(".") or entry.name in IGNORED_DIRS:
+                    continue
+                folders.append(entry.relative_to(self._root).as_posix())
+                walk(entry, depth + 1)
+                if len(folders) >= MAX_LISTED_NOTES:
+                    return
+
+        walk(self._root, 0)
+        return sorted(folders)
+
+    async def list_folders(self) -> list[str]:
+        return await self._call(self._scan_folders)
+
+    def _folder_path(self, folder: str) -> Path:
+        folder = validate_folder(folder)
+        target = self._resolve(folder)
+        if target == self._root:
+            raise ObsidianError("Нельзя изменять корень хранилища.", 400)
+        return target
+
+    def _trash_target(self, relative: str) -> Path:
+        """Уникальный путь в `.trash`, чтобы удаление было обратимым."""
+        target = self._root / ".trash" / relative
+        if target.exists():
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            target = target.with_name(f"{target.name}-{stamp}")
+            counter = 2
+            while target.exists():
+                target = target.with_name(f"{target.name}-{counter}")
+                counter += 1
+        return target
+
+    async def create_folder(self, folder: str) -> bool:
+        if self._dry_run:
+            log.info("[dry-run] создание папки %s пропущено", folder)
+            return False
+
+        def create() -> bool:
+            target = self._folder_path(folder)
+            if target.exists():
+                if target.is_dir():
+                    raise ObsidianError(f"Папка уже существует: {folder}", 409)
+                raise ObsidianError(f"На этом месте файл: {folder}", 409)
+            target.mkdir(parents=True)
+            return True
+
+        created = await self._call(create)
+        log.info("Папка создана: %s", folder)
+        return created
+
+    async def rename_folder(self, folder: str, new_path: str) -> bool:
+        if self._dry_run:
+            log.info("[dry-run] переименование папки %s пропущено", folder)
+            return False
+
+        def rename() -> bool:
+            source = self._folder_path(folder)
+            target = self._folder_path(new_path)
+            if source == target:
+                raise ObsidianError("Новый путь папки совпадает со старым.", 400)
+            if source in target.parents:
+                raise ObsidianError("Нельзя переместить папку внутрь себя.", 400)
+            if not source.is_dir():
+                raise ObsidianError(f"Папка не найдена: {folder}", 404)
+            if target.exists():
+                raise ObsidianError(f"Папка уже существует: {new_path}", 409)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source.rename(target)
+            return True
+
+        renamed = await self._call(rename)
+        log.info("Папка переименована: %s → %s", folder, new_path)
+        return renamed
+
+    async def delete_folder(self, folder: str) -> bool:
+        if self._dry_run:
+            log.info("[dry-run] удаление папки %s пропущено", folder)
+            return False
+
+        def delete() -> bool:
+            source = self._folder_path(folder)
+            if not source.is_dir():
+                raise ObsidianError(f"Папка не найдена: {folder}", 404)
+            relative = source.relative_to(self._root).as_posix()
+            target = self._trash_target(relative)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source.rename(target)
+            return True
+
+        deleted = await self._call(delete)
+        log.info("Папка удалена (в .trash): %s", folder)
+        return deleted
+
+    async def delete_note(self, path: str) -> bool:
+        if self._dry_run:
+            log.info("[dry-run] удаление заметки %s пропущено", path)
+            return False
+
+        path = validate_path(path)
+
+        def delete() -> bool:
+            source = self._resolve(path)
+            if not source.is_file():
+                raise ObsidianError(f"Заметка не найдена: {path}", 404)
+            relative = source.relative_to(self._root).as_posix()
+            target = self._trash_target(relative)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source.rename(target)
+            return True
+
+        deleted = await self._call(delete)
+        log.info("Заметка удалена (в .trash): %s", path)
+        return deleted
+
+    async def copy_note(self, source: str, destination: str) -> bool:
+        if self._dry_run:
+            log.info("[dry-run] копирование %s → %s пропущено", source, destination)
+            return False
+
+        source = validate_path(source)
+        destination = validate_path(destination)
+
+        def copy() -> bool:
+            origin = self._resolve(source)
+            target = self._resolve(destination)
+            if not origin.is_file():
+                raise ObsidianError(f"Заметка не найдена: {source}", 404)
+            if origin == target:
+                raise ObsidianError("Новый путь совпадает со старым.", 400)
+            if target.exists():
+                raise ObsidianError(f"Объект уже существует: {destination}", 409)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(origin, target)
+            return True
+
+        copied = await self._call(copy)
+        log.info("Заметка скопирована: %s → %s", source, destination)
+        return copied
+
+    async def move_note(self, source: str, destination: str) -> bool:
+        if self._dry_run:
+            log.info("[dry-run] перенос %s → %s пропущен", source, destination)
+            return False
+
+        source = validate_path(source)
+        destination = validate_path(destination)
+
+        def move() -> bool:
+            origin = self._resolve(source)
+            target = self._resolve(destination)
+            if not origin.is_file():
+                raise ObsidianError(f"Заметка не найдена: {source}", 404)
+            if origin == target:
+                raise ObsidianError("Новый путь совпадает со старым.", 400)
+            if target.exists():
+                raise ObsidianError(f"Объект уже существует: {destination}", 409)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            origin.rename(target)
+            return True
+
+        moved = await self._call(move)
+        log.info("Заметка перемещена: %s → %s", source, destination)
+        return moved
+
     async def folder_exists(self, folder: str) -> bool:
         folder = folder.strip().strip("/")
         if not folder:
@@ -403,9 +794,13 @@ class VaultClient(ObsidianBackend):
         return await self._call(read)
 
     async def search(self, query: str, limit: int) -> list[dict[str, Any]]:
-        """Полнотекстовый поиск чтением файлов: индекса Obsidian не требуется."""
-        needle = " ".join(query.split()).lower()
-        if not needle:
+        """Полнотекстовый поиск чтением файлов: индекса Obsidian не требуется.
+
+        Запрос очищается от служебных слов и пунктуации, поэтому «Найди
+        "код заморожен"» находит строку «Код заморожен» в заметке. Совпадение
+        фразы целиком весит больше, чем совпадение отдельных слов.
+        """
+        if not query_terms(query):
             return []
 
         def scan() -> list[dict[str, Any]]:
@@ -418,23 +813,21 @@ class VaultClient(ObsidianBackend):
                     text = target.read_text(encoding="utf-8-sig", errors="replace")
                 except OSError:
                     continue
-                flat = " ".join(text.split())
-                position = flat.lower().find(needle)
-                if position < 0:
+
+                match = content_score(text, query)
+                if match is None:
                     continue
-                start = max(0, position - 40)
-                end = min(len(flat), position + len(needle) + 80)
-                context = flat[start:end]
-                if start:
-                    context = "…" + context
-                if end < len(flat):
-                    context = context + "…"
+                score, _position = match
                 results.append(
-                    {"filename": path, "matches": [{"context": context}]}
+                    {
+                        "filename": path,
+                        "score": score,
+                        "matches": [{"context": excerpt(text, query)}],
+                    }
                 )
-                if len(results) >= limit:
-                    break
-            return results
+
+            results.sort(key=lambda item: (-item["score"], item["filename"]))
+            return results[:limit]
 
         return await self._call(scan)
 

@@ -19,7 +19,12 @@ from app.links import (
     note_title,
 )
 from app.llm import ChatClient, LLMError, ToolCall
-from app.notes import slugify, validate_path
+from app.notes import (
+    destination_path,
+    slugify,
+    validate_folder,
+    validate_path,
+)
 from app.obsidian import ObsidianBackend, ObsidianError
 from app.templates import render, template_paths
 
@@ -73,7 +78,11 @@ WRITE_RULES = (
     "4. Пути — относительно корня хранилища, с .md.\n"
     "5. Если просят оформить заметку по шаблону: вызови list_templates, прочитай "
     "подходящий через read_note и сохрани все его разделы и их порядок.\n"
-    "6. Отвечай коротко и по делу."
+    "6. Перед удалением, переносом и копированием найди точный путь через "
+    "search_notes; не выдумывай пути.\n"
+    "7. Новый раздел или папку создавай только если их ещё нет; для папок "
+    "сначала посмотри list_folders.\n"
+    "8. Отвечай коротко и по делу."
 )
 
 STYLE_RULES = (
@@ -155,13 +164,15 @@ LINK_PROMPT = (
 class Proposal:
     """Изменение, которое ждёт решения пользователя."""
 
-    kind: str  # create | append | section | links | bulk
+    kind: str  # create | append | section | links | bulk | ...
     title: str = ""
     path: str = ""
     heading: str = ""
     mode: str = ""
     content: str = ""
     folder: str = ""
+    destination: str = ""
+    level: int = 2
 
 
 @dataclass(frozen=True)
@@ -437,6 +448,97 @@ class Agent:
             log.info("Предложение проставить связи во всех заметках")
             return AgentResult(text="", proposal=Proposal(kind="bulk"))
 
+        if call.name == "create_section":
+            path = _argument(call.arguments, "path")
+            heading = _argument(call.arguments, "heading").lstrip("#").strip()
+            content = _argument(call.arguments, "content", strip=False)
+            level = _int_argument(call.arguments, "level", default=2)
+            try:
+                path = validate_path(path)
+            except ValueError as error:
+                return AgentResult(text=f"Некорректный путь заметки: {error}.")
+            if not heading:
+                return AgentResult(text="Модель не указала заголовок раздела.")
+            if level < 1 or level > 6:
+                return AgentResult(text="Уровень раздела должен быть от 1 до 6.")
+            log.info("Предложение создать раздел «%s» в %s", heading, path)
+            return AgentResult(
+                text="",
+                proposal=Proposal(
+                    kind="section_create",
+                    path=path,
+                    heading=heading,
+                    content=content,
+                    level=level,
+                ),
+            )
+
+        if call.name == "create_folder":
+            folder = _argument(call.arguments, "folder")
+            try:
+                folder = validate_folder(folder)
+            except ValueError as error:
+                return AgentResult(text=f"Некорректный путь папки: {error}.")
+            log.info("Предложение создать папку: %s", folder)
+            return AgentResult(
+                text="", proposal=Proposal(kind="folder_create", path=folder)
+            )
+
+        if call.name == "rename_folder":
+            folder = _argument(call.arguments, "path")
+            new_path = _argument(call.arguments, "new_path")
+            try:
+                folder = validate_folder(folder)
+                new_path = validate_folder(new_path)
+            except ValueError as error:
+                return AgentResult(text=f"Некорректный путь папки: {error}.")
+            if folder == new_path:
+                return AgentResult(text="Новый путь папки совпадает со старым.")
+            log.info("Предложение переименовать папку: %s → %s", folder, new_path)
+            return AgentResult(
+                text="",
+                proposal=Proposal(
+                    kind="folder_rename", path=folder, destination=new_path
+                ),
+            )
+
+        if call.name == "delete_folder":
+            folder = _argument(call.arguments, "folder")
+            try:
+                folder = validate_folder(folder)
+            except ValueError as error:
+                return AgentResult(text=f"Некорректный путь папки: {error}.")
+            log.info("Предложение удалить папку: %s", folder)
+            return AgentResult(
+                text="", proposal=Proposal(kind="folder_delete", path=folder)
+            )
+
+        if call.name in ("move_note", "copy_note"):
+            path = _argument(call.arguments, "path")
+            destination = _argument(call.arguments, "destination")
+            try:
+                path = validate_path(path)
+                destination = destination_path(path, destination)
+            except ValueError as error:
+                return AgentResult(text=f"Некорректный путь: {error}.")
+            kind = "note_move" if call.name == "move_note" else "note_copy"
+            log.info("Предложение %s: %s → %s", kind, path, destination)
+            return AgentResult(
+                text="",
+                proposal=Proposal(kind=kind, path=path, destination=destination),
+            )
+
+        if call.name == "delete_note":
+            path = _argument(call.arguments, "path")
+            try:
+                path = validate_path(path)
+            except ValueError as error:
+                return AgentResult(text=f"Некорректный путь заметки: {error}.")
+            log.info("Предложение удалить заметку: %s", path)
+            return AgentResult(
+                text="", proposal=Proposal(kind="note_delete", path=path)
+            )
+
         path = _argument(call.arguments, "path")
         content = _argument(call.arguments, "content", strip=False)
         try:
@@ -484,6 +586,8 @@ class Agent:
     async def _run_tool(self, call: ToolCall) -> str:
         if call.name == "search_notes":
             return await self._search(_argument(call.arguments, "query"))
+        if call.name == "list_notes":
+            return await self._notes(_argument(call.arguments, "folder"))
         if call.name == "list_folders":
             return await self._folders()
         if call.name == "list_templates":
@@ -516,14 +620,49 @@ class Agent:
                 lines.append(f"- {hit['path']}: {hit['excerpt'][:160]}")
         return "\n".join(lines)
 
+    async def _notes(self, folder: str) -> str:
+        """Заметки в папке или во всём хранилище — для выбора точного пути."""
+        folder = folder.strip().strip("/")
+        try:
+            if folder:
+                folder = validate_folder(folder)
+            notes = await self._obsidian.list_notes()
+        except ValueError as error:
+            return f"Некорректная папка: {error}."
+        except ObsidianError as error:
+            return f"Ошибка списка заметок: {error}"
+
+        if folder:
+            prefix = f"{folder}/"
+            notes = [note for note in notes if note.startswith(prefix)]
+        if not notes:
+            return "Заметок нет."
+
+        shown: list[str] = []
+        used = 0
+        for note in notes:
+            if len(shown) >= 100 or used + len(note) + 3 > 3000:
+                break
+            shown.append(note)
+            used += len(note) + 3
+        lines = [f"- {note}" for note in shown]
+        if len(notes) > len(shown):
+            lines.append(f"… и ещё {len(notes) - len(shown)}")
+        return "\n".join(lines)
+
     async def _folders(self) -> str:
         try:
-            notes = await self._obsidian.list_notes()
+            folders = await self._obsidian.list_folders()
         except ObsidianError as error:
-            return f"Ошибка списка файлов: {error}"
+            return f"Ошибка списка папок: {error}"
 
-        folders = sorted({note.rsplit("/", 1)[0] for note in notes if "/" in note})
-        return ", ".join(folders) if folders else "Папок нет."
+        if not folders:
+            return "Папок нет."
+        shown = folders[:100]
+        result = ", ".join(shown)
+        if len(folders) > len(shown):
+            result += f" … и ещё {len(folders) - len(shown)}"
+        return result
 
     async def _templates(self) -> str:
         try:
@@ -637,3 +776,16 @@ def _argument(arguments: str, name: str, *, strip: bool = True) -> str:
     if not isinstance(value, str):
         return ""
     return value.strip() if strip else value
+
+
+def _int_argument(arguments: str, name: str, *, default: int) -> int:
+    """Целочисленный аргумент; модель может прислать число строкой."""
+    try:
+        data = json.loads(arguments)
+    except json.JSONDecodeError:
+        return default
+    value = data.get(name) if isinstance(data, dict) else None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default

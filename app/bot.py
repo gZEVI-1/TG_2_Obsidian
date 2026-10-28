@@ -37,6 +37,7 @@ from app.notes import (
     build_path,
     clean_folder,
     contains_text,
+    create_section,
     find_section,
     folder_from_text,
     replace_section,
@@ -73,6 +74,7 @@ BTN_NOTE_NEW = "📝 Новая заметка"
 BTN_NOTE_APPEND = "➕ Дописать"
 BTN_NOTE_EDIT = "✏️ Править раздел"
 BTN_NOTE_FIND = "🔎 Найти"
+BTN_FOLDERS = "🗂 Папки"
 BTN_LINKS = "🔗 Связи во всех заметках"
 
 # Страница 1: вход в чат. Страница 2: сценарии работы с заметками.
@@ -89,6 +91,7 @@ KEYBOARD_SCENARIOS = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_NOTE_NEW), KeyboardButton(text=BTN_NOTE_APPEND)],
         [KeyboardButton(text=BTN_NOTE_EDIT), KeyboardButton(text=BTN_NOTE_FIND)],
+        [KeyboardButton(text=BTN_FOLDERS)],
         [KeyboardButton(text=BTN_LINKS)],
         [KeyboardButton(text=BTN_BACK)],
     ],
@@ -99,6 +102,7 @@ COMMANDS = [
     BotCommand(command="start", description="Начать заново"),
     BotCommand(command="help", description="Справка"),
     BotCommand(command="new", description="Новый диалог"),
+    BotCommand(command="folders", description="Папки хранилища"),
     BotCommand(command="links", description="Связи во всех заметках"),
     BotCommand(command="llm", description="Состояние LLM-пула"),
     BotCommand(command="llm_reset", description="Сбросить лимиты LLM"),
@@ -107,7 +111,9 @@ COMMANDS = [
 START_TEXT = (
     "Привет! Я ваш помощник по Obsidian.\n\n"
     "Могу найти и прочитать заметку, сохранить новую мысль, дописать в нужный "
-    "раздел или поправить его. Говорите обычными словами — разберусь.\n\n"
+    "раздел или поправить его, создать раздел, поработать с папками, "
+    "переместить, скопировать или удалить заметку. Говорите обычными словами — "
+    "разберусь.\n\n"
     "/new или /start начнут разговор с чистого листа."
 )
 
@@ -123,12 +129,19 @@ HELP_TEXT = (
     "• ➕ Дописать — найдите заметку, выберите раздел, пришлите текст;\n"
     "• ✏️ Править раздел — заменить раздел целиком;\n"
     "• 🔎 Найти — показать заметку;\n"
+    "• 🗂 Папки — список папок хранилища;\n"
     "• 🔗 Связи во всех заметках — план и массовая простановка связей;\n"
     "• ⬅️ Назад — вернуться на первую страницу.\n\n"
+    "Обычными словами можно и больше:\n"
+    "• «создай в заметке … раздел …» — новый раздел;\n"
+    "• «создай папку …», «переименуй папку … в …», «удали папку …»;\n"
+    "• «перемести заметку … в …», «скопируй заметку … в …», «удали заметку …».\n"
+    "Опасные действия бот показывает превью и выполняет только после "
+    "подтверждения.\n\n"
     "Связи появляются в разделе «Связи»: при создании заметки бот предлагает "
     "их кнопкой, а в существующей — по просьбе «свяжи заметку…».\n\n"
-    "Можно и обычными словами: «сохрани мысль…», «допиши в заметку про…».\n\n"
-    "Команды: /start, /help, /new, /links, /llm — состояние моделей и лимитов."
+    "Команды: /start, /help, /new, /folders, /links, /llm — состояние моделей "
+    "и лимитов."
 )
 
 
@@ -381,6 +394,45 @@ async def btn_note_find(message: Message, memory: ChatMemory) -> None:
     )
 
 
+@router.message(Command("folders"))
+@router.message(F.text == BTN_FOLDERS)
+async def cmd_folders(
+    message: Message, memory: ChatMemory, obsidian: ObsidianBackend
+) -> None:
+    """Список папок и подсказка, как ими управлять словами."""
+    memory.clear_flow(message.chat.id)
+    memory.set_page(message.chat.id, "scenarios")
+    try:
+        folders = await obsidian.list_folders()
+    except (ObsidianError, aiohttp.ClientError) as error:
+        await message.answer(
+            _obsidian_error_text(error),
+            reply_markup=_keyboard_for(message.chat.id, memory),
+        )
+        return
+
+    if not folders:
+        text = "Папок пока нет."
+    else:
+        shown: list[str] = []
+        used = 0
+        for folder in folders:
+            if len(shown) >= 50 or used + len(folder) + 3 > 3500:
+                break
+            shown.append(folder)
+            used += len(folder) + 3
+        text = "Папки хранилища:\n" + "\n".join(f"• {folder}" for folder in shown)
+        if len(folders) > len(shown):
+            text += f"\n… и ещё {len(folders) - len(shown)}"
+    text += (
+        "\n\nМожно словами: «создай папку …», «переименуй папку … в …», "
+        "«удали папку …»."
+    )
+    await message.answer(
+        text, reply_markup=_keyboard_for(message.chat.id, memory)
+    )
+
+
 @router.message(Command("links"))
 @router.message(F.text == BTN_LINKS)
 async def cmd_links(
@@ -521,7 +573,11 @@ async def _offer(
         return
 
     links: tuple[str, ...] = ()
-    if settings.agent_auto_link:
+    if settings.agent_auto_link and proposal.kind in (
+        "append",
+        "section",
+        "section_create",
+    ):
         links = tuple(await _proposal_links(agent, obsidian, proposal))
 
     if _needs_confirm(settings, proposal.kind):
@@ -571,11 +627,10 @@ async def _proposal_links(
 async def _known_folders(obsidian: ObsidianBackend) -> list[str]:
     """Папки хранилища для подсказок; недоступное хранилище — не ошибка."""
     try:
-        notes = await obsidian.list_notes()
+        return await obsidian.list_folders()
     except (ObsidianError, aiohttp.ClientError) as error:
         log.warning("Не удалось получить папки хранилища: %s", error)
         return []
-    return sorted({note.rsplit("/", 1)[0] for note in notes if "/" in note})
 
 
 def _with_folder(proposal: Proposal, folders: list[str]) -> Proposal:
@@ -1447,6 +1502,70 @@ async def _apply(
     links: tuple[str, ...] = (),
 ) -> str:
     """Выполняет предложение и возвращает текст результата для пользователя."""
+    if proposal.kind == "section_create":
+        try:
+            current = await obsidian.read_note(path)
+            updated = create_section(
+                current, proposal.heading, proposal.content, proposal.level
+            )
+            if links:
+                updated = add_links(updated, list(links))
+            written = await obsidian.write_note(path, updated, overwrite=True)
+        except ValueError as error:
+            return f"Не удалось создать раздел: {error}."
+        except (ObsidianError, aiohttp.ClientError) as error:
+            return _obsidian_error_text(error)
+        if written:
+            return f"Раздел «{proposal.heading}» создан: {path}{_links_line(links)}"
+        return f"Dry-run: раздел в «{path}» не создан."
+
+    if proposal.kind in (
+        "folder_create",
+        "folder_rename",
+        "folder_delete",
+        "note_move",
+        "note_copy",
+        "note_delete",
+    ):
+        try:
+            if proposal.kind == "folder_create":
+                done = await obsidian.create_folder(proposal.path)
+            elif proposal.kind == "folder_rename":
+                done = await obsidian.rename_folder(
+                    proposal.path, proposal.destination
+                )
+            elif proposal.kind == "folder_delete":
+                done = await obsidian.delete_folder(proposal.path)
+            elif proposal.kind == "note_move":
+                done = await obsidian.move_note(
+                    proposal.path, proposal.destination
+                )
+            elif proposal.kind == "note_copy":
+                done = await obsidian.copy_note(
+                    proposal.path, proposal.destination
+                )
+            else:
+                done = await obsidian.delete_note(proposal.path)
+        except ValueError as error:
+            return f"Некорректный путь: {error}."
+        except (ObsidianError, aiohttp.ClientError) as error:
+            return _obsidian_error_text(error)
+
+        if not done:
+            return f"Dry-run: действие «{_proposal_title(proposal)}» не выполнено."
+
+        if proposal.kind == "folder_create":
+            return f"Папка создана: {proposal.path}"
+        if proposal.kind == "folder_rename":
+            return f"Папка переименована: {proposal.path} → {proposal.destination}"
+        if proposal.kind == "folder_delete":
+            return f"Папка удалена (в корзину): {proposal.path}"
+        if proposal.kind == "note_move":
+            return f"Заметка перемещена: {proposal.path} → {proposal.destination}"
+        if proposal.kind == "note_copy":
+            return f"Заметка скопирована: {proposal.path} → {proposal.destination}"
+        return f"Заметка удалена (в корзину): {proposal.path}"
+
     if proposal.kind == "create":
         content = add_links(proposal.content, list(links)) if links else proposal.content
         try:
@@ -1506,7 +1625,17 @@ def _needs_confirm(settings: Settings, kind: str) -> bool:
         return True
     if settings.agent_confirmation == "never":
         return False
-    return kind in ("append", "section")
+    return kind in (
+        "append",
+        "section",
+        "section_create",
+        "folder_create",
+        "folder_rename",
+        "folder_delete",
+        "note_move",
+        "note_copy",
+        "note_delete",
+    )
 
 
 def _preview(text: str) -> str:
@@ -1518,6 +1647,39 @@ def _preview(text: str) -> str:
 
 def _proposal_text(proposal: Proposal, links: tuple[str, ...] = ()) -> str:
     hint = _links_line(links)
+    if proposal.kind == "section_create":
+        body = _preview(proposal.content) if proposal.content.strip() else "(пустой)"
+        return (
+            f"Создать раздел «{proposal.heading}» в «{proposal.path}»:\n\n"
+            f"{body}{hint}\n\nПодтвердить?"
+        )
+    if proposal.kind == "folder_create":
+        return f"Создать папку «{proposal.path}»?"
+    if proposal.kind == "folder_rename":
+        return (
+            f"Переименовать папку «{proposal.path}» → "
+            f"«{proposal.destination}»?\n\nСодержимое папки сохранится."
+        )
+    if proposal.kind == "folder_delete":
+        return (
+            f"Удалить папку «{proposal.path}» со всем содержимым?\n\n"
+            "В файловом режиме она переместится в `.trash`."
+        )
+    if proposal.kind == "note_delete":
+        return (
+            f"Удалить заметку «{proposal.path}»?\n\n"
+            "В файловом режиме она переместится в `.trash`."
+        )
+    if proposal.kind == "note_move":
+        return (
+            f"Переместить заметку «{proposal.path}» → "
+            f"«{proposal.destination}»?"
+        )
+    if proposal.kind == "note_copy":
+        return (
+            f"Скопировать заметку «{proposal.path}» → "
+            f"«{proposal.destination}»?"
+        )
     if proposal.kind == "create":
         folder = f"\n\nПапка: {proposal.folder}" if proposal.folder else ""
         return (
@@ -1539,6 +1701,19 @@ def _proposal_text(proposal: Proposal, links: tuple[str, ...] = ()) -> str:
         f"{verb} раздел «{proposal.heading}» в «{proposal.path}»:\n\n"
         f"{_preview(proposal.content)}{hint}\n\nПодтвердить?"
     )
+
+
+def _proposal_title(proposal: Proposal) -> str:
+    """Короткое название действия для сообщений об ошибках и dry-run."""
+    return {
+        "section_create": "создание раздела",
+        "folder_create": "создание папки",
+        "folder_rename": "переименование папки",
+        "folder_delete": "удаление папки",
+        "note_move": "перемещение заметки",
+        "note_copy": "копирование заметки",
+        "note_delete": "удаление заметки",
+    }.get(proposal.kind, proposal.kind)
 
 
 def _links_line(links: tuple[str, ...]) -> str:
@@ -1718,9 +1893,11 @@ def _obsidian_error_text(error: Exception) -> str:
     if status in (401, 403):
         return "Obsidian отклонил ключ. Проверьте OBSIDIAN_API_KEY в .env."
     if status == 404:
-        return "Заметка не найдена."
+        return "Заметка или папка не найдена."
     if status == 409:
-        return "Заметка уже существует. Перезапись запрещена."
+        return "Объект уже существует: перезапись запрещена."
+    if status == 400:
+        return f"Недопустимая операция: {error}"
     if status == 429:
         return "Obsidian ограничил частоту запросов. Попробуйте позже."
     if isinstance(status, int) and status >= 500:

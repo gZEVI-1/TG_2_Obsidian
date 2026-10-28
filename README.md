@@ -14,6 +14,10 @@ Local REST API (нужен запущенный Obsidian). Подробност�
 описания вашего стиля (`AGENT_STYLE_NOTE`). Подробности —
 [docs/07_templates_style.md](docs/07_templates_style.md).
 
+Бот также создаёт разделы, заводит и переименовывает папки, копирует, переносит
+и удаляет заметки. Удаление обратимое: в файловом режиме объект уходит в
+`.trash`. Подробности — [docs/09_manage.md](docs/09_manage.md).
+
 Документация: [docs/README.md](docs/README.md).
 Функциональные требования: [docs/FEATURES.md](docs/FEATURES.md).
 
