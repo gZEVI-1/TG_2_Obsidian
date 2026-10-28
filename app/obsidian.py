@@ -9,6 +9,7 @@ from urllib.parse import quote
 import aiohttp
 
 from app.config import Settings
+from app.search import rank
 
 log = logging.getLogger(__name__)
 
@@ -82,6 +83,64 @@ class ObsidianClient:
                 )
             data = await response.json(content_type=None)
         return list(data)[:limit]
+
+    async def search_notes(self, query: str, limit: int = 5) -> list[dict[str, str]]:
+        """Поиск по именам (точно и нечётко) и содержимому: имена — первыми.
+
+        Штатный поиск Obsidian ранжирует совпадения по тексту и ссылкам,
+        поэтому заметка с именем «Мария» может стоять ниже чужих упоминаний.
+        Здесь сначала идут имена: точное, с этого слова, содержащее слово,
+        затем похожие (опечатки, другой порядок слов), и только потом
+        результаты полнотекстового поиска.
+        """
+        if not query.strip():
+            return []
+
+        hits: list[dict[str, str]] = []
+        seen: set[str] = set()
+
+        try:
+            names = await self.list_notes()
+        except (ObsidianError, aiohttp.ClientError):
+            names = []
+
+        for path, _score, kind in rank(query, names):
+            hits.append(
+                {
+                    "path": path,
+                    "match": kind,
+                    "excerpt": (
+                        "совпадение в названии"
+                        if kind == "имя"
+                        else "похожее название"
+                    ),
+                }
+            )
+            seen.add(path)
+            if len(hits) >= limit:
+                return hits[:limit]
+
+        if len(hits) < limit:
+            try:
+                raw = await self.search(query, limit=limit * 2)
+            except (ObsidianError, aiohttp.ClientError):
+                raw = []
+
+            for item in raw:
+                path = str(item.get("filename", ""))
+                if not path or path in seen:
+                    continue
+                context = " ".join(
+                    (item.get("matches") or [{}])[0].get("context", "").split()
+                )
+                hits.append(
+                    {"path": path, "match": "текст", "excerpt": context[:160]}
+                )
+                seen.add(path)
+                if len(hits) >= limit:
+                    break
+
+        return hits[:limit]
 
     async def list_notes(self) -> list[str]:
         """Все .md-файлы хранилища, рекурсивно; глубина и число ограничены."""

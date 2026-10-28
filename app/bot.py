@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, replace
 
 import aiohttp
@@ -21,13 +22,14 @@ from aiogram.types import (
 
 from app.agent import SYSTEM_PROMPT, Agent, Proposal
 from app.config import Settings
-from app.llm import LLMClient, LLMError
+from app.llm import LLMAllExhaustedError, LLMError, LLMPool, LLMStatus
 from app.notes import (
     append_to_note,
     append_to_section,
     build_path,
     contains_text,
     replace_section,
+    sections,
     validate_path,
 )
 from app.obsidian import ObsidianClient, ObsidianError
@@ -44,11 +46,29 @@ MAX_BUTTON_CHARS = 40
 BTN_NEW = "🆕 Новый диалог"
 BTN_HELP = "📖 Справка"
 BTN_START = "🔄 Начать заново"
+BTN_STAY = "💬 Остаться в этом чате"
+BTN_BACK = "⬅️ Назад"
 
-MAIN_KEYBOARD = ReplyKeyboardMarkup(
+BTN_NOTE_NEW = "📝 Новая заметка"
+BTN_NOTE_APPEND = "➕ Дописать"
+BTN_NOTE_EDIT = "✏️ Править раздел"
+BTN_NOTE_FIND = "🔎 Найти"
+
+# Страница 1: вход в чат. Страница 2: сценарии работы с заметками.
+KEYBOARD_HOME = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text=BTN_NEW), KeyboardButton(text=BTN_HELP)],
-        [KeyboardButton(text=BTN_START)],
+        [KeyboardButton(text=BTN_STAY)],
+        [KeyboardButton(text=BTN_NEW), KeyboardButton(text=BTN_START)],
+        [KeyboardButton(text=BTN_HELP)],
+    ],
+    resize_keyboard=True,
+)
+
+KEYBOARD_SCENARIOS = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=BTN_NOTE_NEW), KeyboardButton(text=BTN_NOTE_APPEND)],
+        [KeyboardButton(text=BTN_NOTE_EDIT), KeyboardButton(text=BTN_NOTE_FIND)],
+        [KeyboardButton(text=BTN_BACK)],
     ],
     resize_keyboard=True,
 )
@@ -57,6 +77,8 @@ COMMANDS = [
     BotCommand(command="start", description="Начать заново"),
     BotCommand(command="help", description="Справка"),
     BotCommand(command="new", description="Новый диалог"),
+    BotCommand(command="llm", description="Состояние LLM-пула"),
+    BotCommand(command="llm_reset", description="Сбросить лимиты LLM"),
 ]
 
 START_TEXT = (
@@ -67,15 +89,19 @@ START_TEXT = (
 )
 
 HELP_TEXT = (
-    "Что я умею:\n"
-    "• найти заметку по описанию и пересказать её;\n"
-    "• сохранить мысль в новую заметку — вы выберете папку;\n"
-    "• дописать текст в подходящий раздел;\n"
-    "• заменить или дополнить раздел.\n\n"
-    "Просто скажите, что нужно: «сохрани мысль…», «допиши в заметку про…», "
-    "«замени раздел…». Перед записью покажу, что именно изменю.\n\n"
-    "Команды: /start — новый диалог, /help — эта справка, /new — забыть "
-    "контекст. То же самое — кнопками внизу."
+    "Внизу две страницы кнопок.\n\n"
+    "Первая: «Остаться в этом чате» — перейти к работе с заметками, "
+    "«Новый диалог» и «Начать заново» — очистить контекст и открыть сценарии, "
+    "«Справка» — эта подсказка.\n\n"
+    "Вторая страница — сценарии, они идут по шагам и не требуют, чтобы модель "
+    "угадывала смысл:\n"
+    "• 📝 Новая заметка — пришлите текст, потом выберете папку;\n"
+    "• ➕ Дописать — найдите заметку, выберите раздел, пришлите текст;\n"
+    "• ✏️ Править раздел — заменить раздел целиком;\n"
+    "• 🔎 Найти — показать заметку;\n"
+    "• ⬅️ Назад — вернуться на первую страницу.\n\n"
+    "Можно и обычными словами: «сохрани мысль…», «допиши в заметку про…».\n\n"
+    "Команды: /start, /help, /new, /llm — состояние моделей и лимитов."
 )
 
 
@@ -89,6 +115,18 @@ class PendingAction:
     folders: tuple[str, ...] = ()
 
 
+@dataclass
+class Flow:
+    """Пошаговый сценарий, запущенный кнопкой (без участия модели)."""
+
+    kind: str  # create | append | edit | find
+    step: str  # text | note | pick_note | section | content
+    path: str = ""
+    section: str = ""
+    candidates: tuple[str, ...] = ()
+    sections: tuple[str, ...] = ()
+
+
 class ChatMemory:
     """История диалога и ожидающие решения по `chat_id`.
 
@@ -100,6 +138,8 @@ class ChatMemory:
         self._max_messages = max_messages
         self._messages: dict[int, list[dict[str, str]]] = {}
         self._actions: dict[int, tuple[int, PendingAction]] = {}
+        self._flows: dict[int, Flow] = {}
+        self._pages: dict[int, str] = {}
 
     def get(self, chat_id: int) -> list[dict[str, str]]:
         """Копия истории: вызывающая сторона не может изменить хранилище."""
@@ -128,28 +168,82 @@ class ChatMemory:
     def drop_action(self, chat_id: int) -> None:
         self._actions.pop(chat_id, None)
 
+    def set_flow(self, chat_id: int, flow: Flow) -> None:
+        self._flows[chat_id] = flow
+
+    def get_flow(self, chat_id: int) -> Flow | None:
+        return self._flows.get(chat_id)
+
+    def clear_flow(self, chat_id: int) -> None:
+        self._flows.pop(chat_id, None)
+
+    def set_page(self, chat_id: int, page: str) -> None:
+        """Запоминает, какая страница клавиатуры сейчас у пользователя."""
+        self._pages[chat_id] = page
+
+    def get_page(self, chat_id: int) -> str:
+        return self._pages.get(chat_id, "home")
+
     def clear(self, chat_id: int) -> None:
         self._messages.pop(chat_id, None)
         self._actions.pop(chat_id, None)
+        self._flows.pop(chat_id, None)
+        self._pages.pop(chat_id, None)
+
+
+def _keyboard_for(chat_id: int, memory: ChatMemory) -> ReplyKeyboardMarkup:
+    """Клавиатура текущей страницы чата."""
+    return (
+        KEYBOARD_SCENARIOS
+        if memory.get_page(chat_id) == "scenarios"
+        else KEYBOARD_HOME
+    )
 
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, memory: ChatMemory) -> None:
     memory.clear(message.chat.id)
-    await message.answer(START_TEXT, reply_markup=MAIN_KEYBOARD)
+    memory.set_page(message.chat.id, "home")
+    await message.answer(START_TEXT, reply_markup=KEYBOARD_HOME)
 
 
 @router.message(Command("help"))
-async def cmd_help(message: Message) -> None:
-    await message.answer(HELP_TEXT, reply_markup=MAIN_KEYBOARD)
+async def cmd_help(message: Message, memory: ChatMemory) -> None:
+    await message.answer(
+        HELP_TEXT, reply_markup=_keyboard_for(message.chat.id, memory)
+    )
 
 
 @router.message(Command("new"))
 async def cmd_new(message: Message, memory: ChatMemory) -> None:
     memory.clear(message.chat.id)
+    memory.set_page(message.chat.id, "scenarios")
     await message.answer(
         "Новый диалог начат: предыдущие сообщения забыты.",
-        reply_markup=MAIN_KEYBOARD,
+        reply_markup=KEYBOARD_SCENARIOS,
+    )
+
+
+@router.message(Command("llm_reset"))
+async def cmd_llm_reset(
+    message: Message, llm: LLMPool, memory: ChatMemory
+) -> None:
+    """Сбрасывает лимиты и возвращает пул к лучшей модели/первому аккаунту."""
+    llm.reset(reason="команда /llm_reset")
+    status = llm.status()
+    await message.answer(
+        "LLM: лимиты сброшены. Снова работают все пары, старт — "
+        f"{status.active_model} / {status.active_account}.",
+        reply_markup=_keyboard_for(message.chat.id, memory),
+    )
+
+
+@router.message(Command("llm"))
+async def cmd_llm(message: Message, llm: LLMPool, memory: ChatMemory) -> None:
+    """Показывает, какая модель/аккаунт активны и когда будет автосброс."""
+    await message.answer(
+        _llm_status_text(llm.status()),
+        reply_markup=_keyboard_for(message.chat.id, memory),
     )
 
 
@@ -157,17 +251,76 @@ async def cmd_new(message: Message, memory: ChatMemory) -> None:
 # не участвует, поэтому нажатие всегда означает одно и то же.
 @router.message(F.text == BTN_START)
 async def btn_start(message: Message, memory: ChatMemory) -> None:
-    await cmd_start(message, memory)
+    """Начать заново: чистим диалог и уходим к сценариям."""
+    memory.clear(message.chat.id)
+    memory.set_page(message.chat.id, "scenarios")
+    await message.answer(
+        "Начали заново. Выберите сценарий ниже.",
+        reply_markup=KEYBOARD_SCENARIOS,
+    )
 
 
 @router.message(F.text == BTN_HELP)
-async def btn_help(message: Message) -> None:
-    await cmd_help(message)
+async def btn_help(message: Message, memory: ChatMemory) -> None:
+    await cmd_help(message, memory)
 
 
 @router.message(F.text == BTN_NEW)
 async def btn_new(message: Message, memory: ChatMemory) -> None:
     await cmd_new(message, memory)
+
+
+@router.message(F.text == BTN_STAY)
+async def btn_stay(message: Message, memory: ChatMemory) -> None:
+    """Остаёмся в текущем диалоге и переходим к сценариям заметок."""
+    memory.set_page(message.chat.id, "scenarios")
+    await message.answer(
+        "Чем займёмся? Выберите сценарий ниже.", reply_markup=KEYBOARD_SCENARIOS
+    )
+
+
+@router.message(F.text == BTN_BACK)
+async def btn_back(message: Message, memory: ChatMemory) -> None:
+    """Возврат на первую страницу; незавершённый сценарий отменяется."""
+    memory.clear_flow(message.chat.id)
+    memory.set_page(message.chat.id, "home")
+    await message.answer("Главное меню.", reply_markup=KEYBOARD_HOME)
+
+
+@router.message(F.text == BTN_NOTE_NEW)
+async def btn_note_new(message: Message, memory: ChatMemory) -> None:
+    memory.set_flow(message.chat.id, Flow("create", "text"))
+    await message.answer(
+        "Пришлите текст заметки — первую строку сделаю заголовком.",
+        reply_markup=_flow_cancel_keyboard(),
+    )
+
+
+@router.message(F.text == BTN_NOTE_APPEND)
+async def btn_note_append(message: Message, memory: ChatMemory) -> None:
+    memory.set_flow(message.chat.id, Flow("append", "note"))
+    await message.answer(
+        "В какую заметку дописать? Напишите часть названия или слово из текста.",
+        reply_markup=_flow_cancel_keyboard(),
+    )
+
+
+@router.message(F.text == BTN_NOTE_EDIT)
+async def btn_note_edit(message: Message, memory: ChatMemory) -> None:
+    memory.set_flow(message.chat.id, Flow("edit", "note"))
+    await message.answer(
+        "Какую заметку правим? Напишите часть названия.",
+        reply_markup=_flow_cancel_keyboard(),
+    )
+
+
+@router.message(F.text == BTN_NOTE_FIND)
+async def btn_note_find(message: Message, memory: ChatMemory) -> None:
+    memory.set_flow(message.chat.id, Flow("find", "note"))
+    await message.answer(
+        "Что ищем? Напишите слово или часть названия.",
+        reply_markup=_flow_cancel_keyboard(),
+    )
 
 
 @router.message(F.text)
@@ -180,6 +333,11 @@ async def answer_text(
 ) -> None:
     chat_id = message.chat.id
     text = message.text or ""
+
+    flow = memory.get_flow(chat_id)
+    if flow is not None:
+        await _handle_flow(message, memory, settings, obsidian, flow)
+        return
 
     pending = memory.get_action_any(chat_id)
     if pending is not None and pending.stage == "folder_input":
@@ -208,7 +366,9 @@ async def answer_text(
         result = await agent.handle(messages)
     except LLMError as error:
         log.error("LLM не ответила: %s", error)
-        await message.answer(_llm_error_text(error), reply_markup=MAIN_KEYBOARD)
+        await message.answer(
+            _llm_error_text(error), reply_markup=_keyboard_for(chat_id, memory)
+        )
         return
 
     if result.proposal is not None:
@@ -218,7 +378,8 @@ async def answer_text(
 
     memory.add(chat_id, text, result.text)
     await message.answer(
-        result.text or "Модель вернула пустой ответ.", reply_markup=MAIN_KEYBOARD
+        result.text or "Модель вернула пустой ответ.",
+        reply_markup=_keyboard_for(chat_id, memory)
     )
 
 
@@ -251,6 +412,264 @@ async def _offer(
 
     memory.drop_action(chat_id)
     await message.answer(await _apply(obsidian, proposal, proposal.path))
+
+
+def _flow_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Отмена", callback_data="flow:cancel")]
+        ]
+    )
+
+
+def _split_title(text: str) -> tuple[str, str]:
+    """Заголовок новой заметки — первая непустая строка текста."""
+    for line in text.splitlines():
+        title = line.strip().lstrip("#").strip()
+        if title:
+            return title[: MAX_BUTTON_CHARS * 2], text.strip()
+    return "Без названия", text.strip()
+
+
+async def _handle_flow(
+    message: Message,
+    memory: ChatMemory,
+    settings: Settings,
+    obsidian: ObsidianClient,
+    flow: Flow,
+) -> None:
+    """Продолжает пошаговый сценарий, запущенный кнопкой."""
+    chat_id = message.chat.id
+    text = (message.text or "").strip()
+
+    if flow.kind == "create" and flow.step == "text":
+        memory.clear_flow(chat_id)
+        if not text:
+            await message.answer("Пусто — пришлите текст заметки.")
+            return
+        title, content = _split_title(text)
+        await _offer(
+            message,
+            memory,
+            settings,
+            obsidian,
+            Proposal(kind="create", title=title, content=content),
+        )
+        return
+
+    if flow.step == "note":
+        await _flow_search(message, memory, obsidian, flow, text)
+        return
+
+    if flow.step == "content":
+        memory.clear_flow(chat_id)
+        if not text:
+            await message.answer("Пусто — пришлите текст.")
+            return
+        if flow.kind == "append":
+            proposal = Proposal(
+                kind="append", path=flow.path, heading=flow.section, content=text
+            )
+        else:
+            proposal = Proposal(
+                kind="section",
+                path=flow.path,
+                heading=flow.section,
+                mode="replace",
+                content=text,
+            )
+        await _offer(message, memory, settings, obsidian, proposal)
+        return
+
+    await message.answer(
+        "Выберите вариант кнопкой выше или нажмите «Отмена».",
+        reply_markup=_flow_cancel_keyboard(),
+    )
+
+
+async def _flow_search(
+    message: Message,
+    memory: ChatMemory,
+    obsidian: ObsidianClient,
+    flow: Flow,
+    query: str,
+) -> None:
+    chat_id = message.chat.id
+    if not query:
+        await message.answer("Напишите слово или часть названия.")
+        return
+
+    try:
+        hits = await obsidian.search_notes(query, limit=8)
+    except (ObsidianError, aiohttp.ClientError) as error:
+        memory.clear_flow(chat_id)
+        await message.answer(
+            _obsidian_error_text(error), reply_markup=_keyboard_for(chat_id, memory)
+        )
+        return
+
+    paths = [hit["path"] for hit in hits if hit.get("path")]
+    if not paths:
+        memory.clear_flow(chat_id)
+        await message.answer(
+            "Ничего не нашёл. Попробуйте другие слова.",
+            reply_markup=_keyboard_for(chat_id, memory),
+        )
+        return
+
+    if len(paths) == 1:
+        await _flow_pick(message, memory, obsidian, flow, paths[0])
+        return
+
+    flow.candidates = tuple(paths[:5])
+    flow.step = "pick_note"
+    memory.set_flow(chat_id, flow)
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=_button_label(path), callback_data=f"flow:note:{index}"
+            )
+        ]
+        for index, path in enumerate(flow.candidates)
+    ]
+    rows.append([InlineKeyboardButton(text="Отмена", callback_data="flow:cancel")])
+    await message.answer(
+        f"Нашёл {len(paths)}. Какая именно?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+async def _flow_pick(
+    message: Message,
+    memory: ChatMemory,
+    obsidian: ObsidianClient,
+    flow: Flow,
+    path: str,
+) -> None:
+    chat_id = message.chat.id
+    try:
+        note = await obsidian.read_note(path)
+    except (ObsidianError, aiohttp.ClientError) as error:
+        memory.clear_flow(chat_id)
+        await message.answer(
+            _obsidian_error_text(error), reply_markup=_keyboard_for(chat_id, memory)
+        )
+        return
+
+    if flow.kind == "find":
+        memory.clear_flow(chat_id)
+        await message.answer(
+            f"«{path}»:\n\n{_preview(note)}",
+            reply_markup=_keyboard_for(chat_id, memory),
+        )
+        return
+
+    headings = sections(note)
+    if flow.kind == "edit" and not headings:
+        memory.clear_flow(chat_id)
+        await message.answer(
+            f"В заметке «{path}» нет разделов — править нечего. "
+            "Можно дописать текст в конец.",
+            reply_markup=_keyboard_for(chat_id, memory),
+        )
+        return
+
+    flow.path = path
+    flow.sections = tuple(headings[:8])
+    flow.step = "section"
+    memory.set_flow(chat_id, flow)
+
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=_button_label(heading), callback_data=f"flow:section:{index}"
+            )
+        ]
+        for index, heading in enumerate(flow.sections)
+    ]
+    if flow.kind == "append":
+        rows.append(
+            [InlineKeyboardButton(text="В конец заметки", callback_data="flow:end")]
+        )
+    rows.append([InlineKeyboardButton(text="Отмена", callback_data="flow:cancel")])
+    question = "Куда дописать?" if flow.kind == "append" else "Какой раздел заменить?"
+    await message.answer(
+        f"{question}\n\n«{path}»",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+async def _active_flow(
+    callback: CallbackQuery, memory: ChatMemory, step: str
+) -> Flow | None:
+    if callback.message is None:
+        return None
+    flow = memory.get_flow(callback.message.chat.id)
+    if flow is None or flow.step != step:
+        await callback.message.edit_text(
+            "Этот шаг уже неактуален — начните заново кнопкой."
+        )
+        return None
+    return flow
+
+
+@router.callback_query(F.data == "flow:cancel")
+async def on_flow_cancel(callback: CallbackQuery, memory: ChatMemory) -> None:
+    await callback.answer("Отменено")
+    if callback.message is None:
+        return
+    memory.clear_flow(callback.message.chat.id)
+    await callback.message.edit_text("Отменил.")
+
+
+@router.callback_query(F.data.startswith("flow:note:"))
+async def on_flow_note(
+    callback: CallbackQuery, memory: ChatMemory, obsidian: ObsidianClient
+) -> None:
+    await callback.answer()
+    flow = await _active_flow(callback, memory, "pick_note")
+    if flow is None:
+        return
+
+    index = int(callback.data.rsplit(":", 1)[1])
+    if index >= len(flow.candidates):
+        await callback.message.edit_text("Этот вариант больше не актуален.")
+        return
+    await _flow_pick(callback.message, memory, obsidian, flow, flow.candidates[index])
+
+
+@router.callback_query(F.data.startswith("flow:section:"))
+async def on_flow_section(callback: CallbackQuery, memory: ChatMemory) -> None:
+    await callback.answer()
+    flow = await _active_flow(callback, memory, "section")
+    if flow is None:
+        return
+
+    index = int(callback.data.rsplit(":", 1)[1])
+    if index >= len(flow.sections):
+        await callback.message.edit_text("Этот вариант больше не актуален.")
+        return
+
+    flow.section = flow.sections[index]
+    flow.step = "content"
+    memory.set_flow(callback.message.chat.id, flow)
+    verb = "дописать в" if flow.kind == "append" else "записать в"
+    await callback.message.edit_text(
+        f"Пришлите текст, который {verb} раздел «{flow.section}»."
+    )
+
+
+@router.callback_query(F.data == "flow:end")
+async def on_flow_end(callback: CallbackQuery, memory: ChatMemory) -> None:
+    await callback.answer()
+    flow = await _active_flow(callback, memory, "section")
+    if flow is None:
+        return
+
+    flow.section = ""
+    flow.step = "content"
+    memory.set_flow(callback.message.chat.id, flow)
+    await callback.message.edit_text("Пришлите текст, который дописать в конец заметки.")
 
 
 @router.callback_query(F.data == "act:inbox")
@@ -645,16 +1064,53 @@ def _guess_folders(title: str, content: str, folders: list[str]) -> list[str]:
     return found[:MAX_FOLDER_CHOICES]
 
 
+def _llm_status_text(status: LLMStatus) -> str:
+    """Короткая сводка пула для команды /llm."""
+    mode = "заглушки" if status.stub else "реальный API"
+    lines = [
+        f"Режим LLM: {mode}",
+        f"Сейчас: {status.active_model} · {status.active_account}",
+        f"Доступно пар «модель — аккаунт»: "
+        f"{status.available_slots} из {status.total_slots}",
+    ]
+    if status.reset_at is not None:
+        lines.append(f"Автосброс: {time.strftime('%d.%m %H:%M', time.localtime(status.reset_at))}")
+    else:
+        lines.append("Автосброс: не требуется")
+
+    lines.append("Модели (от лучшей к запасной):")
+    for index, model in enumerate(status.models, start=1):
+        lines.append(f"{index}. {model}")
+
+    lines.append("Аккаунты: " + (", ".join(status.accounts) or "<нет>"))
+
+    if status.disabled:
+        lines.append("Отключены (ключ отклонён): " + ", ".join(status.disabled))
+    if status.exhausted:
+        shown = status.exhausted[:8]
+        lines.append("Лимиты до сброса:")
+        for model, account, until in shown:
+            lines.append(
+                f"• {account} / {model} — "
+                f"{time.strftime('%d.%m %H:%M', time.localtime(until))}"
+            )
+        if len(status.exhausted) > len(shown):
+            lines.append(f"… и ещё {len(status.exhausted) - len(shown)}")
+
+    return "\n".join(lines)
+
+
 def _llm_error_text(error: LLMError) -> str:
+    if isinstance(error, LLMAllExhaustedError):
+        return f"{error}. Можно подождать или выполнить /llm_reset."
     message = str(error)
-    if "HTTP 429" in message:
+    if error.status in (401, 403) or "HTTP 401" in message or "HTTP 403" in message:
+        return "Модель отклонила ключ. Проверьте LLM_API_*_KEY в .env."
+    if error.status in (402, 429) or "HTTP 429" in message or "HTTP 402" in message:
         return (
-            "У модели закончился дневной лимит бесплатных запросов (50 в сутки). "
-            "Он обнулится в 00:00 UTC — это 04:00 по Дубаю. Можно подождать "
-            "или сменить LLM_MODEL в .env на другую бесплатную модель."
+            "У модели закончился лимит запросов. Пул уже переключает аккаунты "
+            "и модели; состояние — /llm."
         )
-    if "HTTP 401" in message or "HTTP 403" in message:
-        return "Модель отклонила ключ. Проверьте LLM_API_KEY в .env."
     return "Не удалось получить ответ от модели. Попробуйте позже."
 
 
@@ -680,9 +1136,9 @@ def _obsidian_error_text(error: Exception) -> str:
 
 async def run_bot(settings: Settings) -> None:
     """Запускает бота и блокируется до остановки (Ctrl+C)."""
-    llm = LLMClient(settings)
+    pool = LLMPool(settings)
     obsidian = ObsidianClient(settings)
-    agent = Agent(llm, obsidian, settings)
+    agent = Agent(pool, obsidian, settings)
     memory = ChatMemory()
     bot = Bot(token=settings.telegram_bot_token)
     dispatcher = Dispatcher()
@@ -695,6 +1151,7 @@ async def run_bot(settings: Settings) -> None:
         await bot.set_my_commands(COMMANDS)
         # На случай, если для токена ранее был настроен webhook.
         await bot.delete_webhook(drop_pending_updates=True)
+        pool.start_auto_reset()
         # Объекты попадают в обработчики как keyword-аргументы (workflow data).
         await dispatcher.start_polling(
             bot,
@@ -702,9 +1159,10 @@ async def run_bot(settings: Settings) -> None:
             obsidian=obsidian,
             memory=memory,
             settings=settings,
+            llm=pool,
         )
     finally:
-        await llm.close()
+        await pool.close()
         await obsidian.close()
         await bot.session.close()
         log.info("Бот остановлен")

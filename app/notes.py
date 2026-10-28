@@ -111,6 +111,19 @@ def _join_blocks(existing: str, block: str) -> str:
     return f"{existing}{separator}{block}"
 
 
+def sections(text: str) -> list[str]:
+    """Заголовки разделов (уровень 2 и глубже) в порядке появления.
+
+    Заголовок первого уровня считается названием заметки и разделом не является.
+    """
+    result: list[str] = []
+    for line in text.splitlines():
+        match = _HEADING_RE.match(line.rstrip("\n"))
+        if match and len(match.group(1)) >= 2:
+            result.append(match.group(2).strip())
+    return result
+
+
 def contains_text(note: str, fragment: str) -> bool:
     """Проверяет, есть ли фрагмент в заметке (без учёта регистра и пробелов)."""
     def normalize(value: str) -> str:

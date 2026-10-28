@@ -10,7 +10,7 @@ import aiohttp
 
 from app.bot import run_bot
 from app.config import Settings, load_settings
-from app.llm import LLMClient, LLMError
+from app.llm import LLMError, LLMPool
 from app.logging_setup import setup_logging
 from app.obsidian import ObsidianClient, ObsidianError
 
@@ -67,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     group.add_argument(
         "--check-llm",
         action="store_true",
-        help="проверить LLM: ответ модели и поддержку tool-calls",
+        help="проверить LLM: ответ, tool-calls и состояние пула аккаунтов",
     )
     return parser.parse_args()
 
@@ -92,25 +92,52 @@ async def check_obsidian(settings: Settings) -> None:
 
 
 async def check_llm(settings: Settings) -> None:
-    """Проверяет ключ, модель и поддержку tool-calls (два запроса к LLM)."""
-    async with LLMClient(settings) as client:
-        answer = await client.chat([{"role": "user", "content": CHECK_LLM_PROMPT}])
-        log.info("Модель ответила (%s): %s", answer.model, answer.text or "<пусто>")
-
-        probe = await client.chat(
-            [{"role": "user", "content": CHECK_LLM_TOOL_PROMPT}],
-            tools=[CHECK_LLM_TOOL],
-        )
-        if probe.tool_calls:
-            call = probe.tool_calls[0]
-            log.info("Tool-calls поддерживаются: %s(%s)", call.name, call.arguments)
-        else:
-            log.warning(
-                "Модель не вызвала инструмент (finish_reason=%s, ответ: %s). "
-                "Tool-calls под вопросом — проверим на Этапе 5.",
-                probe.finish_reason,
-                probe.text or "<пусто>",
+    """Проверяет пул: ответ, поддержку tool-calls и состояние ротации."""
+    async with LLMPool(settings) as pool:
+        if settings.llm_stub:
+            log.info(
+                "LLM: режим заглушек (LLM_STUB=true), реальный API не вызывается. "
+                "Квота: %d запросов на пару, сброс через %d с.",
+                settings.llm_stub_quota,
+                settings.llm_stub_reset_seconds,
             )
+
+        answer = await pool.chat([{"role": "user", "content": CHECK_LLM_PROMPT}])
+        log.info(
+            "Модель ответила (%s, аккаунт %s): %s",
+            answer.model,
+            pool.status().active_account,
+            answer.text or "<пусто>",
+        )
+
+        if settings.llm_stub:
+            log.info("Режим заглушек: проверка tool-calls пропущена")
+        else:
+            probe = await pool.chat(
+                [{"role": "user", "content": CHECK_LLM_TOOL_PROMPT}],
+                tools=[CHECK_LLM_TOOL],
+            )
+            if probe.tool_calls:
+                call = probe.tool_calls[0]
+                log.info("Tool-calls поддерживаются: %s(%s)", call.name, call.arguments)
+            else:
+                log.warning(
+                    "Модель не вызвала инструмент (finish_reason=%s, ответ: %s). "
+                    "Tool-calls под вопросом.",
+                    probe.finish_reason,
+                    probe.text or "<пусто>",
+                )
+
+        status = pool.status()
+        log.info(
+            "LLM-пул: доступно %d из %d пар, активна %s / %s",
+            status.available_slots,
+            status.total_slots,
+            status.active_model,
+            status.active_account,
+        )
+        if status.reset_at is not None:
+            log.warning("LLM-пул: лимиты исчерпаны, автосброс позже")
 
 
 def main() -> None:
@@ -151,8 +178,9 @@ def main() -> None:
             raise SystemExit(2) from error
         except aiohttp.ClientError as error:
             log.error(
-                "Не удалось подключиться к %s: %s. Проверьте LLM_BASE_URL и сеть.",
-                settings.llm_base_url,
+                "Не удалось подключиться к LLM (%s): %s. Проверьте аккаунты, "
+                "LLM_STUB и сеть.",
+                settings.llm_base_url or "LLM_API_*",
                 error,
             )
             raise SystemExit(2) from error
