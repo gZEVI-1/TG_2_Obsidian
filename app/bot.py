@@ -20,7 +20,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
-from app.agent import SYSTEM_PROMPT, Agent, Proposal
+from app.agent import Agent, Proposal
 from app.config import Settings
 from app.llm import LLMAllExhaustedError, LLMError, LLMPool, LLMStatus
 from app.notes import (
@@ -38,6 +38,7 @@ from app.obsidian import (
     ObsidianError,
     create_obsidian_client,
 )
+from app.templates import MAX_TEMPLATE_CHARS, template_name, template_paths
 
 log = logging.getLogger(__name__)
 
@@ -46,6 +47,7 @@ router = Router(name="main")
 MAX_HISTORY_MESSAGES = 20
 PREVIEW_CHARS = 700
 MAX_FOLDER_CHOICES = 3
+MAX_TEMPLATE_CHOICES = 6
 MAX_BUTTON_CHARS = 40
 
 BTN_NEW = "🆕 Новый диалог"
@@ -100,7 +102,8 @@ HELP_TEXT = (
     "«Справка» — эта подсказка.\n\n"
     "Вторая страница — сценарии, они идут по шагам и не требуют, чтобы модель "
     "угадывала смысл:\n"
-    "• 📝 Новая заметка — пришлите текст, потом выберете папку;\n"
+    "• 📝 Новая заметка — выберите шаблон (если он есть), пришлите текст, "
+    "потом папку;\n"
     "• ➕ Дописать — найдите заметку, выберите раздел, пришлите текст;\n"
     "• ✏️ Править раздел — заменить раздел целиком;\n"
     "• 🔎 Найти — показать заметку;\n"
@@ -125,11 +128,12 @@ class Flow:
     """Пошаговый сценарий, запущенный кнопкой (без участия модели)."""
 
     kind: str  # create | append | edit | find
-    step: str  # text | note | pick_note | section | content
+    step: str  # template | text | note | pick_note | section | content
     path: str = ""
     section: str = ""
     candidates: tuple[str, ...] = ()
     sections: tuple[str, ...] = ()
+    template: str = ""
 
 
 class ChatMemory:
@@ -293,11 +297,39 @@ async def btn_back(message: Message, memory: ChatMemory) -> None:
 
 
 @router.message(F.text == BTN_NOTE_NEW)
-async def btn_note_new(message: Message, memory: ChatMemory) -> None:
-    memory.set_flow(message.chat.id, Flow("create", "text"))
+async def btn_note_new(
+    message: Message,
+    memory: ChatMemory,
+    template_files: tuple[str, ...],
+) -> None:
+    """Создание заметки: сначала шаблон (если есть), затем текст."""
+    chat_id = message.chat.id
+    if not template_files:
+        memory.set_flow(chat_id, Flow("create", "text"))
+        await message.answer(
+            "Пришлите текст заметки — первую строку сделаю заголовком.",
+            reply_markup=_flow_cancel_keyboard(),
+        )
+        return
+
+    flow = Flow("create", "template", candidates=template_files)
+    memory.set_flow(chat_id, flow)
+    rows = [
+        [InlineKeyboardButton(text="Без шаблона", callback_data="flow:template:-1")]
+    ]
+    rows.extend(
+        [
+            InlineKeyboardButton(
+                text=_button_label(template_name(path)),
+                callback_data=f"flow:template:{index}",
+            )
+        ]
+        for index, path in enumerate(template_files)
+    )
+    rows.append([InlineKeyboardButton(text="Отмена", callback_data="flow:cancel")])
     await message.answer(
-        "Пришлите текст заметки — первую строку сделаю заголовком.",
-        reply_markup=_flow_cancel_keyboard(),
+        "Оформить по шаблону?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
 
 
@@ -356,7 +388,7 @@ async def answer_text(
         return
 
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": agent.system_prompt},
         *memory.get(chat_id),
         {"role": "user", "content": text},
     ]
@@ -469,7 +501,7 @@ async def _handle_flow(
             await message.answer("Пусто — пришлите текст заметки.", reply_markup=keyboard)
             return
         try:
-            title, content = await agent.compose_note(text)
+            title, content = await agent.compose_note(text, flow.template)
         except LLMError as error:
             log.error("Не удалось оформить заметку: %s", error)
             await message.answer(
@@ -674,6 +706,40 @@ async def on_flow_cancel(callback: CallbackQuery, memory: ChatMemory) -> None:
         return
     memory.clear_flow(callback.message.chat.id)
     await callback.message.edit_text("Отменил.")
+
+
+@router.callback_query(F.data.startswith("flow:template:"))
+async def on_flow_template(
+    callback: CallbackQuery, memory: ChatMemory, obsidian: ObsidianBackend
+) -> None:
+    await callback.answer()
+    flow = await _active_flow(callback, memory, "template")
+    if flow is None:
+        return
+
+    index = int(callback.data.rsplit(":", 1)[1])
+    template = ""
+    if index >= 0:
+        if index >= len(flow.candidates):
+            await callback.message.edit_text("Этот вариант больше не актуален.")
+            return
+        try:
+            template = await obsidian.read_note(flow.candidates[index])
+        except (ObsidianError, aiohttp.ClientError) as error:
+            memory.clear_flow(callback.message.chat.id)
+            await callback.message.edit_text(_obsidian_error_text(error))
+            return
+        template = template[:MAX_TEMPLATE_CHARS]
+
+    flow.template = template
+    flow.step = "text"
+    flow.candidates = ()
+    memory.set_flow(callback.message.chat.id, flow)
+    await callback.message.edit_text(
+        "Пришлите текст заметки — оформлю его по выбранному шаблону."
+        if template
+        else "Пришлите текст заметки — первую строку сделаю заголовком."
+    )
 
 
 @router.callback_query(F.data.startswith("flow:note:"))
@@ -1188,11 +1254,53 @@ def _obsidian_error_text(error: Exception) -> str:
     return f"Ошибка Obsidian: {error}"
 
 
+async def _load_template_files(
+    obsidian: ObsidianBackend, settings: Settings
+) -> tuple[str, ...]:
+    """Запоминает шаблоны при старте: кнопка создания не ждёт сеть."""
+    try:
+        notes = await obsidian.list_notes()
+    except (ObsidianError, aiohttp.ClientError) as error:
+        log.warning("Не удалось получить список шаблонов: %s", error)
+        return ()
+
+    paths = template_paths(
+        notes, settings.agent_template_folder, exclude=settings.agent_style_note
+    )
+    if paths:
+        log.info(
+            "Шаблоны заметок (%s): %s",
+            settings.agent_template_folder,
+            ", ".join(paths),
+        )
+    return tuple(paths[:MAX_TEMPLATE_CHOICES])
+
+
+async def _load_style(obsidian: ObsidianBackend, settings: Settings) -> str:
+    """Читает заметку-описание стиля; без неё бот работает как раньше."""
+    if not settings.agent_style_note:
+        return ""
+    try:
+        style = await obsidian.read_note(settings.agent_style_note)
+    except (ObsidianError, aiohttp.ClientError) as error:
+        log.warning(
+            "Не удалось прочитать стиль %s: %s", settings.agent_style_note, error
+        )
+        return ""
+    log.info(
+        "Стиль пользователя загружен: %s (%d симв.)",
+        settings.agent_style_note,
+        len(style),
+    )
+    return style
+
+
 async def run_bot(settings: Settings) -> None:
     """Запускает бота и блокируется до остановки (Ctrl+C)."""
     pool = LLMPool(settings)
     obsidian = create_obsidian_client(settings)
-    agent = Agent(pool, obsidian, settings)
+    agent = Agent(pool, obsidian, settings, style=await _load_style(obsidian, settings))
+    template_files = await _load_template_files(obsidian, settings)
     memory = ChatMemory()
     bot = Bot(token=settings.telegram_bot_token)
     dispatcher = Dispatcher()
@@ -1214,6 +1322,7 @@ async def run_bot(settings: Settings) -> None:
             memory=memory,
             settings=settings,
             llm=pool,
+            template_files=template_files,
         )
     finally:
         await pool.close()

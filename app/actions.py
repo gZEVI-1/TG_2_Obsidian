@@ -53,6 +53,16 @@ ACTIONS: tuple[Action, ...] = (
         parameters={"type": "object", "properties": {}},
     ),
     Action(
+        name="list_templates",
+        title="Шаблоны заметок",
+        hint="когда пользователь просит оформить заметку по шаблону",
+        description=(
+            "Показать шаблоны из папки шаблонов. Прочитай подходящий через "
+            "read_note и оформи заметку по его разделам."
+        ),
+        parameters={"type": "object", "properties": {}},
+    ),
+    Action(
         name="read_note",
         title="Прочитать заметку",
         hint="когда нужно ответить по содержанию или подготовить правку",

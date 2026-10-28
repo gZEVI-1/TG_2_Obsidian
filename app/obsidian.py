@@ -485,10 +485,11 @@ class VaultClient(ObsidianBackend):
 
 
 def create_obsidian_client(settings: Settings) -> ObsidianBackend:
-    """Выбирает клиент: файловый режим, если задан OBSIDIAN_VAULT_PATH."""
-    if settings.obsidian_vault_path:
+    """Выбирает клиент по OBSIDIAN_MODE (в auto — по наличию пути к vault)."""
+    if settings.effective_obsidian_mode == "vault":
         log.info(
-            "Obsidian: прямой доступ к файлам %s (REST API не используется)",
+            "Obsidian: режим vault, прямой доступ к файлам %s "
+            "(REST API не используется)",
             settings.obsidian_vault_path,
         )
         return VaultClient(settings)

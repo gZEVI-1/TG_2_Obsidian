@@ -75,7 +75,7 @@ def parse_args() -> argparse.Namespace:
 async def check_obsidian(settings: Settings) -> None:
     async with create_obsidian_client(settings) as client:
         status = await client.health()
-        if settings.obsidian_mode == "vault":
+        if settings.effective_obsidian_mode == "vault":
             log.info(
                 "Хранилище доступно напрямую: %s (writable=%s)",
                 status.get("path", settings.obsidian_vault_path),
@@ -168,7 +168,7 @@ def main() -> None:
             log.error("Obsidian: %s", error)
             raise SystemExit(2) from error
         except aiohttp.ClientError as error:
-            if settings.obsidian_mode == "vault":
+            if settings.effective_obsidian_mode == "vault":
                 log.error(
                     "Не удалось прочитать хранилище %s: %s.",
                     settings.obsidian_vault_path,

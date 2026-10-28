@@ -297,6 +297,8 @@
 | `AGENT_AUTO_LINK` | `true`, `false` | `true` | 7 |
 | `AGENT_SEARCH_LIMIT` | целое, 1–20 | `5` | 5 |
 | `AGENT_LINK_LIMIT` | целое, 1–50 | `10` | 7 |
+| `AGENT_TEMPLATE_FOLDER` | путь папки | `Templates` | 6 |
+| `AGENT_STYLE_NOTE` | путь к `.md` | пусто | 6 |
 
 Неверные значения валидируются при загрузке настроек: опечатка должна
 проявляться сразу, а не молча подставляться.

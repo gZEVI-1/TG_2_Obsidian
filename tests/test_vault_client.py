@@ -3,15 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from app.config import Settings
-from app.obsidian import ObsidianError, VaultClient, create_obsidian_client
+from app.config import Settings, load_settings
+from app.obsidian import (
+    ObsidianClient,
+    ObsidianError,
+    VaultClient,
+    create_obsidian_client,
+)
 
 
-def make_settings(vault: Path, *, dry_run: bool = False) -> Settings:
+def make_settings(
+    vault: Path, *, dry_run: bool = False, mode: str = "auto"
+) -> Settings:
     return Settings(
         telegram_bot_token="test-token",
         llm_base_url="",
@@ -32,6 +41,7 @@ def make_settings(vault: Path, *, dry_run: bool = False) -> Settings:
         agent_auto_folder=True,
         agent_search_limit=5,
         log_level="INFO",
+        obsidian_mode=mode,
         obsidian_vault_path=str(vault),
     )
 
@@ -116,6 +126,54 @@ class VaultClientTests(unittest.TestCase):
         status = self.run_async(client.health())
         self.assertEqual(status["service"], "Obsidian vault (direct filesystem)")
         self.assertTrue(status["authenticated"])
+
+
+class ModeTests(unittest.TestCase):
+    """OBSIDIAN_MODE: auto / rest / vault."""
+
+    def load(self, **env: str) -> Settings:
+        with patch.dict(os.environ, env, clear=True), patch(
+            "app.config.ENV_FILE", Path("no-such.env")
+        ):
+            return load_settings()
+
+    def test_auto_uses_vault_when_path_is_set(self) -> None:
+        settings = self.load(OBSIDIAN_VAULT_PATH=r"E:\Vault")
+        self.assertEqual(settings.effective_obsidian_mode, "vault")
+
+    def test_auto_uses_rest_without_path(self) -> None:
+        self.assertEqual(self.load().effective_obsidian_mode, "rest")
+
+    def test_rest_ignores_vault_path(self) -> None:
+        settings = self.load(
+            OBSIDIAN_MODE="rest", OBSIDIAN_VAULT_PATH=r"E:\Vault"
+        )
+        self.assertEqual(settings.obsidian_mode, "rest")
+        self.assertEqual(settings.effective_obsidian_mode, "rest")
+
+    def test_vault_requires_path(self) -> None:
+        with self.assertRaises(ValueError):
+            self.load(OBSIDIAN_MODE="vault")
+
+    def test_unknown_mode_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            self.load(OBSIDIAN_MODE="api")
+
+    def test_factory_respects_rest_mode(self) -> None:
+        settings = self.load(
+            OBSIDIAN_MODE="rest",
+            OBSIDIAN_VAULT_PATH=r"E:\Vault",
+            OBSIDIAN_API_KEY="test-key",
+        )
+        self.assertIsInstance(create_obsidian_client(settings), ObsidianClient)
+
+    def test_factory_respects_vault_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            settings = self.load(
+                OBSIDIAN_MODE="vault",
+                OBSIDIAN_VAULT_PATH=folder,
+            )
+            self.assertIsInstance(create_obsidian_client(settings), VaultClient)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ ENV_FILE = PROJECT_ROOT / ".env"
 DEFAULT_OBSIDIAN_BASE_URL = "http://127.0.0.1:27123"
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 CONFIRMATION_MODES = ("auto", "always", "never")
+OBSIDIAN_MODES = ("auto", "rest", "vault")
 
 MAX_LLM_ACCOUNTS = 20
 DEFAULT_LLM_COOLDOWN_SECONDS = 3600
@@ -73,12 +74,17 @@ class Settings:
     agent_auto_folder: bool
     agent_search_limit: int
     log_level: str
+    obsidian_mode: str = "auto"
     obsidian_vault_path: str = ""
+    agent_template_folder: str = "Templates"
+    agent_style_note: str = ""
 
     @property
-    def obsidian_mode(self) -> str:
-        """vault — файлы напрямую, rest — Local REST API (нужен запуск Obsidian)."""
-        return "vault" if self.obsidian_vault_path else "rest"
+    def effective_obsidian_mode(self) -> str:
+        """Что реально используется: vault, rest или путь решает в auto."""
+        if self.obsidian_mode == "auto":
+            return "vault" if self.obsidian_vault_path else "rest"
+        return self.obsidian_mode
 
     def safe_summary(self) -> dict[str, str]:
         """Безопасное представление настроек для логов: без значений секретов."""
@@ -99,9 +105,16 @@ class Settings:
                 else "<не используется>"
             ),
             "obsidian_mode": (
-                "vault (файлы напрямую)"
-                if self.obsidian_vault_path
-                else "rest (Local REST API)"
+                (
+                    "vault (файлы напрямую)"
+                    if self.effective_obsidian_mode == "vault"
+                    else "rest (Local REST API)"
+                )
+                + (
+                    f", OBSIDIAN_MODE={self.obsidian_mode}"
+                    if self.obsidian_mode != "auto"
+                    else " (авто)"
+                )
             ),
             "obsidian_vault_path": self.obsidian_vault_path or "<не задан>",
             "obsidian_base_url": self.obsidian_base_url,
@@ -111,6 +124,8 @@ class Settings:
             "agent_default_folder": self.agent_default_folder,
             "agent_auto_folder": str(self.agent_auto_folder).lower(),
             "agent_search_limit": str(self.agent_search_limit),
+            "agent_template_folder": self.agent_template_folder,
+            "agent_style_note": self.agent_style_note or "<не задан>",
             "log_level": self.log_level,
         }
 
@@ -231,6 +246,18 @@ def _env_folder(name: str, default: str) -> str:
     return folder
 
 
+def _env_note_path(name: str) -> str:
+    """Путь к заметке в хранилище; пусто — настройка не используется."""
+    path = _env_str(name).strip().strip("/")
+    if not path:
+        return ""
+    if not path.lower().endswith(".md"):
+        raise ValueError(f"{name}: ожидается путь к .md-заметке, получено {path!r}")
+    if ".." in path.split("/"):
+        raise ValueError(f"{name}: путь не должен содержать «..»")
+    return path
+
+
 def load_settings() -> Settings:
     """Читает .env (если есть) и переменные окружения, возвращает Settings."""
     if ENV_FILE.is_file():
@@ -249,6 +276,23 @@ def load_settings() -> Settings:
         raise ValueError(
             "AGENT_CONFIRMATION: ожидается одно из "
             f"{', '.join(CONFIRMATION_MODES)}, получено {confirmation!r}"
+        )
+
+    obsidian_mode = _env_str("OBSIDIAN_MODE", "auto").lower()
+    if obsidian_mode not in OBSIDIAN_MODES:
+        raise ValueError(
+            "OBSIDIAN_MODE: ожидается одно из "
+            f"{', '.join(OBSIDIAN_MODES)}, получено {obsidian_mode!r}"
+        )
+    obsidian_vault_path = _env_str("OBSIDIAN_VAULT_PATH")
+    if obsidian_mode == "vault" and not obsidian_vault_path:
+        raise ValueError(
+            "OBSIDIAN_MODE=vault: задайте путь к хранилищу в OBSIDIAN_VAULT_PATH"
+        )
+    if obsidian_mode == "rest" and obsidian_vault_path:
+        log.warning(
+            "OBSIDIAN_MODE=rest: OBSIDIAN_VAULT_PATH (%s) игнорируется",
+            obsidian_vault_path,
         )
 
     legacy_llm_url = _env_str("LLM_BASE_URL")
@@ -316,5 +360,8 @@ def load_settings() -> Settings:
         agent_auto_folder=_env_bool("AGENT_AUTO_FOLDER", default=True),
         agent_search_limit=_env_int("AGENT_SEARCH_LIMIT", default=5, minimum=1, maximum=20),
         log_level=log_level,
-        obsidian_vault_path=_env_str("OBSIDIAN_VAULT_PATH"),
+        obsidian_mode=obsidian_mode,
+        obsidian_vault_path=obsidian_vault_path,
+        agent_template_folder=_env_folder("AGENT_TEMPLATE_FOLDER", "Templates"),
+        agent_style_note=_env_note_path("AGENT_STYLE_NOTE"),
     )

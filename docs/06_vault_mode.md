@@ -12,10 +12,13 @@ Local REST API — плагин внутри Obsidian, поэтому в реж�
 Добавлен второй клиент хранилища — `VaultClient` в `app/obsidian.py`. Он читает
 и пишет `.md`-файлы напрямую в папке vault, без HTTP и без плагина.
 
-- Выбор режима — переменная `OBSIDIAN_VAULT_PATH`:
-  - пусто → `ObsidianClient` (Local REST API), Obsidian должен быть запущен;
-  - путь к папке vault → `VaultClient`, Obsidian может быть закрыт,
-    `OBSIDIAN_API_KEY` не нужен.
+- Режим выбирается переменной `OBSIDIAN_MODE`:
+  - `auto` (по умолчанию) — `vault`, если задан `OBSIDIAN_VAULT_PATH`, иначе `rest`;
+  - `rest` — `ObsidianClient` (Local REST API), Obsidian должен быть запущен;
+  - `vault` — `VaultClient`, Obsidian может быть закрыт, `OBSIDIAN_API_KEY`
+    не нужен; путь в `OBSIDIAN_VAULT_PATH` обязателен.
+- Явный `OBSIDIAN_MODE` позволяет переключаться, не комментируя путь:
+  `OBSIDIAN_MODE=rest` при заполненном `OBSIDIAN_VAULT_PATH` работает через API.
 - Оба клиента реализуют общий интерфейс `ObsidianBackend` (`health`,
   `search`, `list_notes`, `folder_exists`, `note_exists`, `read_note`,
   `write_note`). Поиск по именам `search_notes` тоже общий, поэтому поведение
@@ -38,18 +41,28 @@ Local REST API — плагин внутри Obsidian, поэтому в реж�
 В `.env`:
 
 ```dotenv
+# rest — через Local REST API, vault — файлы напрямую, auto — по наличию пути
+OBSIDIAN_MODE=vault
 OBSIDIAN_VAULT_PATH=E:\FOLDER\TG-OBS\TG-OBS-vault-test
 # или для рабочего хранилища:
 # OBSIDIAN_VAULT_PATH=C:\Users\user\Documents\MyVault
 ```
 
-`OBSIDIAN_BASE_URL` и `OBSIDIAN_API_KEY` можно оставить — в файловом режиме они
-не используются.
+Переключение на API — поменять одну строку и перезапустить бота:
+
+```dotenv
+OBSIDIAN_MODE=rest
+```
+
+`OBSIDIAN_BASE_URL` и `OBSIDIAN_API_KEY` можно оставить — в режиме `vault`
+они не используются. При `OBSIDIAN_MODE=rest` путь из `OBSIDIAN_VAULT_PATH`
+игнорируется (в лог пишется предупреждение).
 
 ## Проверка
 
 ```powershell
 cd E:\FOLDER\TG-OBS\TG_2_Obsidian
+$env:OBSIDIAN_MODE='vault'
 $env:OBSIDIAN_VAULT_PATH='E:\FOLDER\TG-OBS\TG-OBS-vault-test'
 .\.venv\Scripts\python.exe -m app --check-config      # obsidian_mode = vault
 .\.venv\Scripts\python.exe -m app --check-obsidian    # хранилище доступно, тестовая запись
@@ -58,8 +71,8 @@ $env:OBSIDIAN_VAULT_PATH='E:\FOLDER\TG-OBS\TG-OBS-vault-test'
 Obsidian при этом можно закрыть. Ожидаемые строки:
 
 ```
-app:   obsidian_mode = vault (файлы напрямую)
-app.obsidian: Obsidian: прямой доступ к файлам ... (REST API не используется)
+app:   obsidian_mode = vault (файлы напрямую), OBSIDIAN_MODE=vault
+app.obsidian: Obsidian: режим vault, прямой доступ к файлам ...
 app: Хранилище доступно напрямую: ... (writable=True)
 ```
 
@@ -77,5 +90,6 @@ app: Хранилище доступно напрямую: ... (writable=True)
 
 ## Откат
 
-Убрать `OBSIDIAN_VAULT_PATH` из `.env` и перезапустить бота — снова используется
-Local REST API. Код откатывается возвратом `app/obsidian.py` к версии Этапа 3.
+Убрать `OBSIDIAN_VAULT_PATH` (и/или поставить `OBSIDIAN_MODE=rest`) в `.env`
+и перезапустить бота — снова используется Local REST API. Код откатывается
+возвратом `app/obsidian.py` к версии Этапа 3.

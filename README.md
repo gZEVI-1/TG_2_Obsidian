@@ -5,9 +5,14 @@ Telegram-бот с AI-агентом для Obsidian: через Obsidian Local 
 Создаёт заметки, дополняет и правит существующие, автоматически располагает
 их внутри хранилища, ставит связи и обрабатывает ошибки API/сервера.
 
-Obsidian может быть закрыт: задайте `OBSIDIAN_VAULT_PATH` — бот будет читать
-и писать `.md`-файлы напрямую. Без этой переменной используется Local REST API
-(нужен запущенный Obsidian). Подробности — [docs/06_vault_mode.md](docs/06_vault_mode.md).
+Obsidian может быть закрыт: задайте `OBSIDIAN_MODE=vault` и `OBSIDIAN_VAULT_PATH`
+— бот будет читать и писать `.md`-файлы напрямую. Без этого используется
+Local REST API (нужен запущенный Obsidian). Подробности —
+[docs/06_vault_mode.md](docs/06_vault_mode.md).
+
+Новые заметки можно оформлять по шаблонам из папки `Templates` и с учётом
+описания вашего стиля (`AGENT_STYLE_NOTE`). Подробности —
+[docs/07_templates_style.md](docs/07_templates_style.md).
 
 Документация: [docs/README.md](docs/README.md).
 Функциональные требования: [docs/FEATURES.md](docs/FEATURES.md).

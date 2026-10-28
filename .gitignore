@@ -179,3 +179,7 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Личные шаблоны заметок и описание стиля: адаптированы из рабочего хранилища,
+# копируются в vault и в репозиторий не попадают.
+templates/

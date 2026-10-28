@@ -13,6 +13,7 @@ from app.config import Settings
 from app.llm import ChatClient, LLMError, ToolCall
 from app.notes import slugify, validate_path
 from app.obsidian import ObsidianBackend, ObsidianError
+from app.templates import render, template_paths
 
 log = logging.getLogger(__name__)
 
@@ -60,16 +61,45 @@ WRITE_RULES = (
     "3. Создание и изменение подтверждает пользователь: готовь текст и коротко "
     "объясни, что предлагаешь.\n"
     "4. Пути — относительно корня хранилища, с .md.\n"
-    "5. Отвечай коротко и по делу."
+    "5. Если просят оформить заметку по шаблону: вызови list_templates, прочитай "
+    "подходящий через read_note и сохрани все его разделы и их порядок.\n"
+    "6. Отвечай коротко и по делу."
 )
 
-SYSTEM_PROMPT = BASE_PROMPT + "\n\n" + prompt_block() + PARSE_RULES + WRITE_RULES
+STYLE_RULES = (
+    "\n\nСТИЛЬ ПОЛЬЗОВАТЕЛЯ (из его заметки-описания):\n{style}\n"
+    "- Соблюдай тон, структуру и оформление из этого описания.\n"
+    "- При дописывании в существующую заметку следуй её собственному стилю, "
+    "если он отличается."
+)
+
+
+def build_system_prompt(style: str = "") -> str:
+    """Системный промпт: команды, правила разбора и письма, стиль пользователя."""
+    prompt = BASE_PROMPT + "\n\n" + prompt_block() + PARSE_RULES + WRITE_RULES
+    if style:
+        prompt += STYLE_RULES.format(style=style)
+    return prompt
+
 
 COMPOSE_NOTE_PROMPT = (
     "Оформи заметку для Obsidian по сообщению пользователя.\n"
     "Верни только Markdown: первая строка — заголовок вида «# ...», дальше текст. "
     "Сохрани смысл, разверни формулировки и добавь структуру, если уместно. "
     "Не выдумывай факты.\n\n"
+    "Сообщение:\n{text}"
+)
+
+COMPOSE_TEMPLATE_PROMPT = (
+    "Оформи заметку для Obsidian по шаблону.\n"
+    "Верни только Markdown: заметку целиком, начиная с заголовка «# ...».\n"
+    "Сохрани все разделы шаблона, их заголовки и порядок. Заполни разделы по "
+    "смыслу сообщения; пустые оставь пустыми, факты не выдумывай. Лишних "
+    "разделов не добавляй.\n"
+    "Заголовок заметки — тема из сообщения, а не имя шаблона. Если в шаблоне "
+    "есть frontmatter, сохрани его поля и подставь подходящие значения; "
+    "служебные пометки самого шаблона (например, тег template) не переноси.\n\n"
+    "Шаблон:\n{template}\n\n"
     "Сообщение:\n{text}"
 )
 
@@ -126,10 +156,21 @@ class AgentResult:
 class Agent:
     """Один ход диалога: модель ищет, читает и предлагает изменения."""
 
-    def __init__(self, llm: ChatClient, obsidian: ObsidianBackend, settings: Settings) -> None:
+    def __init__(
+        self,
+        llm: ChatClient,
+        obsidian: ObsidianBackend,
+        settings: Settings,
+        *,
+        style: str = "",
+    ) -> None:
         self._llm = llm
         self._obsidian = obsidian
         self._search_limit = settings.agent_search_limit
+        self._template_folder = settings.agent_template_folder
+        self._style_note = settings.agent_style_note
+        self._style = style.strip()[:4000]
+        self.system_prompt = build_system_prompt(self._style)
 
     async def handle(self, messages: list[dict[str, Any]]) -> AgentResult:
         """Крутит цикл инструментов, пока модель не ответит текстом.
@@ -201,16 +242,28 @@ class Agent:
                 break
         return result
 
-    async def compose_note(self, text: str) -> tuple[str, str]:
-        """Разворачивает сообщение в заметку: (заголовок, полный текст)."""
+    async def compose_note(self, text: str, template: str = "") -> tuple[str, str]:
+        """Разворачивает сообщение в заметку: (заголовок, полный текст).
+
+        Если передан шаблон, модель заполняет его разделы, сохраняя структуру.
+        Плейсхолдеры {{title}}, {{date}}, {{time}} подставляет бот.
+        """
+        prompt = (
+            COMPOSE_TEMPLATE_PROMPT.format(template=template, text=text)
+            if template
+            else COMPOSE_NOTE_PROMPT.format(text=text)
+        )
         response = await self._llm.chat(
-            [{"role": "user", "content": COMPOSE_NOTE_PROMPT.format(text=text)}],
+            [{"role": "user", "content": self._with_style(prompt)}],
             max_tokens=900,
         )
         content = response.text.strip()
         if not content:
             raise LLMError("Модель вернула пустой текст заметки.")
-        return _split_note(content)
+        title, content = _split_note(content)
+        if "{{" in title:
+            title = _title_from_text(text)
+        return title, render(content, title)
 
     async def compose_append(
         self, path: str, section: str, section_text: str, text: str
@@ -238,12 +291,18 @@ class Agent:
 
     async def _compose(self, prompt: str) -> str:
         response = await self._llm.chat(
-            [{"role": "user", "content": prompt}], max_tokens=700
+            [{"role": "user", "content": self._with_style(prompt)}], max_tokens=700
         )
         result = response.text.strip()
         if not result:
             raise LLMError("Модель вернула пустой текст.")
         return result
+
+    def _with_style(self, prompt: str) -> str:
+        """Добавляет описание стиля пользователя, если оно задано."""
+        if not self._style:
+            return prompt
+        return f"{prompt}\n\nСТИЛЬ ПОЛЬЗОВАТЕЛЯ (соблюдай):\n{self._style}"
 
     def _proposal(self, call: ToolCall) -> AgentResult:
         if call.name == "create_note":
@@ -253,6 +312,7 @@ class Agent:
                 return AgentResult(
                     text="Модель предложила заметку без заголовка или текста."
                 )
+            content = render(content, title)
             log.info("Предложение создать заметку: %s (%d симв.)", title, len(content))
             return AgentResult(
                 text="", proposal=Proposal(kind="create", title=title, content=content)
@@ -304,6 +364,8 @@ class Agent:
             return await self._search(_argument(call.arguments, "query"))
         if call.name == "list_folders":
             return await self._folders()
+        if call.name == "list_templates":
+            return await self._templates()
         if call.name == "read_note":
             return await self._read(_argument(call.arguments, "path"))
         return f"Неизвестный инструмент: {call.name}"
@@ -341,6 +403,17 @@ class Agent:
         folders = sorted({note.rsplit("/", 1)[0] for note in notes if "/" in note})
         return ", ".join(folders) if folders else "Папок нет."
 
+    async def _templates(self) -> str:
+        try:
+            notes = await self._obsidian.list_notes()
+        except ObsidianError as error:
+            return f"Ошибка списка шаблонов: {error}"
+
+        paths = template_paths(notes, self._template_folder, exclude=self._style_note)
+        if not paths:
+            return f"Шаблонов нет: папка «{self._template_folder}» пуста."
+        return "\n".join(f"- {path}" for path in paths)
+
     async def _read(self, path: str) -> str:
         if not path:
             return "Ошибка: не указан путь."
@@ -364,6 +437,12 @@ def _split_note(content: str) -> tuple[str, str]:
     if not first:
         return "Без названия", content
     return first[:80], f"# {first}\n\n{content}"
+
+
+def _title_from_text(text: str) -> str:
+    """Запасной заголовок, если модель оставила в нём плейсхолдер."""
+    first = next((line.strip().lstrip("#").strip() for line in text.splitlines() if line.strip()), "")
+    return first[:80] or "Без названия"
 
 
 def _clean_folder_line(line: str) -> str:
