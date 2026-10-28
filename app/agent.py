@@ -155,12 +155,13 @@ LINK_PROMPT = (
 class Proposal:
     """Изменение, которое ждёт решения пользователя."""
 
-    kind: str  # create | append | section
+    kind: str  # create | append | section | links | bulk
     title: str = ""
     path: str = ""
     heading: str = ""
     mode: str = ""
     content: str = ""
+    folder: str = ""
 
 
 @dataclass(frozen=True)
@@ -413,14 +414,23 @@ class Agent:
         if call.name == "create_note":
             title = _argument(call.arguments, "title")
             content = _argument(call.arguments, "content", strip=False)
+            folder = _argument(call.arguments, "folder")
             if not title or not content.strip():
                 return AgentResult(
                     text="Модель предложила заметку без заголовка или текста."
                 )
             content = render(content, title)
-            log.info("Предложение создать заметку: %s (%d симв.)", title, len(content))
+            log.info(
+                "Предложение создать заметку: %s (%d симв.)%s",
+                title,
+                len(content),
+                f", папка «{folder}»" if folder else "",
+            )
             return AgentResult(
-                text="", proposal=Proposal(kind="create", title=title, content=content)
+                text="",
+                proposal=Proposal(
+                    kind="create", title=title, content=content, folder=folder
+                ),
             )
 
         if call.name == "link_all":

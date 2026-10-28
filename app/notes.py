@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 MAX_PATH_LENGTH = 200
@@ -11,6 +12,20 @@ MAX_TITLE_LENGTH = 80
 FORBIDDEN_PATH_CHARS = '\\/:*?"<>|#^[]'
 
 _HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*$")
+_FOLDER_TOKEN_RE = re.compile(r"[\w\-/]+", re.UNICODE)
+_FOLDER_WORD_RE = re.compile(r"[^\W\d_][^\W\d_\-]*", re.UNICODE)
+
+# Слова, которые в ответе «создай папку люди и добавь туда» не являются папкой.
+FOLDER_STOPWORDS = frozenset(
+    {
+        "создай", "создайте", "создать", "сделай", "сделайте", "сделать",
+        "добавь", "добавьте", "добавить", "сохрани", "сохраните", "положи",
+        "положите", "запиши", "запишите", "нужно", "надо", "давай",
+        "папку", "папка", "папке", "папки", "новую", "новая", "новой",
+        "и", "а", "в", "во", "на", "туда", "там", "эту", "это", "её", "ее",
+        "заметку", "заметка", "файл", "пожалуйста", "потом", "затем", "сюда",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -35,6 +50,59 @@ def build_path(folder: str, title: str) -> str:
     folder = folder.strip().strip("/")
     name = slugify(title) + ".md"
     return f"{folder}/{name}" if folder else name
+
+
+def clean_folder(name: str) -> str:
+    """Безопасный путь папки: сегменты через `slugify`, без «.» и «..»."""
+    parts = [
+        slugify(part.strip())
+        for part in name.replace("\\", "/").split("/")
+        if part.strip() and part.strip() not in (".", "..")
+    ]
+    return "/".join(part for part in parts if part and part != "Без названия")
+
+
+def folder_from_text(text: str, folders: Sequence[str] = ()) -> str:
+    """Название папки из ответа пользователя.
+
+    «Создай папку люди и добавь туда» → «Люди» (если такая папка есть),
+    «Проекты/2026» → «Проекты/2026». Если в тексте нет папки, а есть фраза —
+    пустая строка: такой ответ нельзя превращать в путь.
+    """
+    words = [
+        token
+        for token in _FOLDER_TOKEN_RE.findall(text)
+        if token.casefold() not in FOLDER_STOPWORDS
+    ]
+    if not words:
+        return ""
+    if len(words) > 2 and "папк" not in text.casefold():
+        return ""
+
+    candidate = clean_folder(" ".join(words[:4]))
+    for folder in folders:
+        if folder.casefold() == candidate.casefold():
+            return folder
+    return candidate
+
+
+def split_folder_title(title: str, folders: Sequence[str] = ()) -> tuple[str, str]:
+    """Отделяет папку, если модель положила её в заголовок: «Люди/Имя».
+
+    Папкой считается первый сегмент, если он совпадает с существующей папкой
+    или выглядит как одно слово без цифр («Люди»). Заголовки вроде
+    «Q3/Q4 итоги» не трогаем: «Q3» папкой не считается.
+    """
+    head, separator, rest = title.partition("/")
+    head, rest = head.strip(), rest.strip()
+    if not separator or not head or not rest:
+        return title, ""
+
+    known = {folder.casefold() for folder in folders}
+    looks_like_folder = bool(_FOLDER_WORD_RE.fullmatch(head)) and len(head) <= 30
+    if head.casefold() in known or looks_like_folder:
+        return rest, head
+    return title, ""
 
 
 def validate_path(path: str) -> str:

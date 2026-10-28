@@ -35,10 +35,13 @@ from app.notes import (
     append_to_note,
     append_to_section,
     build_path,
+    clean_folder,
     contains_text,
     find_section,
+    folder_from_text,
     replace_section,
     sections,
+    split_folder_title,
     validate_path,
 )
 from app.obsidian import (
@@ -409,14 +412,8 @@ async def answer_text(
         return
 
     pending = memory.get_action_any(chat_id)
-    if pending is not None and pending.stage == "folder_input":
-        memory.drop_action(chat_id)
-        choice = await _resolve_folder(obsidian, settings, pending, text)
-        if choice.action is None:
-            await message.answer(choice.text)
-        else:
-            sent = await message.answer(choice.text, reply_markup=choice.keyboard)
-            memory.set_action(chat_id, choice.action, sent.message_id)
+    if pending is not None and pending.stage in ("folder", "folder_input"):
+        await _reply_folder(message, memory, settings, obsidian, pending, text)
         return
 
     messages = [
@@ -498,18 +495,34 @@ async def _offer(
         )
         return
 
+    if proposal.kind == "create":
+        folders = await _known_folders(obsidian)
+        proposal = _with_folder(proposal, folders)
+        links = (
+            tuple(await _proposal_links(agent, obsidian, proposal))
+            if settings.agent_auto_link
+            else ()
+        )
+        suggestions = await _folder_suggestions(agent, settings, proposal, folders)
+        sent = await message.answer(
+            _proposal_text(proposal, links),
+            reply_markup=_folder_keyboard(settings, suggestions),
+        )
+        memory.set_action(
+            chat_id,
+            PendingAction(
+                proposal,
+                "folder",
+                folders=tuple(suggestions),
+                links=links,
+            ),
+            sent.message_id,
+        )
+        return
+
     links: tuple[str, ...] = ()
     if settings.agent_auto_link:
         links = tuple(await _proposal_links(agent, obsidian, proposal))
-
-    if proposal.kind == "create":
-        sent = await message.answer(
-            _proposal_text(proposal, links), reply_markup=_folder_keyboard(settings)
-        )
-        memory.set_action(
-            chat_id, PendingAction(proposal, "folder", links=links), sent.message_id
-        )
-        return
 
     if _needs_confirm(settings, proposal.kind):
         sent = await message.answer(
@@ -553,6 +566,54 @@ async def _proposal_links(
     except (ObsidianError, aiohttp.ClientError) as error:
         log.warning("Не удалось подобрать связи: %s", error)
         return []
+
+
+async def _known_folders(obsidian: ObsidianBackend) -> list[str]:
+    """Папки хранилища для подсказок; недоступное хранилище — не ошибка."""
+    try:
+        notes = await obsidian.list_notes()
+    except (ObsidianError, aiohttp.ClientError) as error:
+        log.warning("Не удалось получить папки хранилища: %s", error)
+        return []
+    return sorted({note.rsplit("/", 1)[0] for note in notes if "/" in note})
+
+
+def _with_folder(proposal: Proposal, folders: list[str]) -> Proposal:
+    """Папка из аргумента модели или из заголовка («Люди/Имя» → папка «Люди»)."""
+    folder = clean_folder(proposal.folder) if proposal.folder else ""
+    title = proposal.title
+
+    if folder:
+        prefix = f"{folder}/"
+        if title.casefold().startswith(prefix.casefold()):
+            title = title[len(prefix) :].strip() or proposal.title
+    else:
+        title, found = split_folder_title(title, folders)
+        folder = clean_folder(found)
+
+    if not title.strip():
+        title = proposal.title
+    if title == proposal.title and folder == proposal.folder:
+        return proposal
+    return replace(proposal, title=title, folder=folder)
+
+
+async def _folder_suggestions(
+    agent: Agent,
+    settings: Settings,
+    proposal: Proposal,
+    folders: list[str],
+) -> list[str]:
+    """Варианты папок для кнопок: сначала названная, иначе выбор модели."""
+    if proposal.folder:
+        return [proposal.folder]
+    if not settings.agent_auto_folder:
+        return []
+    try:
+        return await agent.suggest_folders(proposal.title, proposal.content, folders)
+    except LLMError as error:
+        log.warning("Не удалось подобрать папку: %s", error)
+        return _guess_folders(proposal.title, proposal.content, folders)
 
 
 async def _offer_bulk(
@@ -1073,7 +1134,8 @@ async def on_other(callback: CallbackQuery, memory: ChatMemory) -> None:
         callback.message.message_id,
     )
     await callback.message.edit_text(
-        "Напишите папку, например «Проекты/2026». Отмена — /start."
+        "Напишите папку, например «Люди» или «Проекты/2026». "
+        "Если такой папки нет, спрошу, создавать ли её."
     )
 
 
@@ -1246,6 +1308,51 @@ async def on_bulk_yes(
     await callback.message.edit_text(await _apply_bulk(obsidian, action.plan))
 
 
+async def _reply_folder(
+    message: Message,
+    memory: ChatMemory,
+    settings: Settings,
+    obsidian: ObsidianBackend,
+    action: PendingAction,
+    text: str,
+) -> None:
+    """Текст на шаге выбора папки — это папка, а не новый запрос к модели.
+
+    «Создай папку люди и добавь туда» понимается как папка «Люди»; если такой
+    папки нет, дальше будет вопрос «Создать её?», а не молчаливая ошибка.
+    """
+    chat_id = message.chat.id
+    folders = await _known_folders(obsidian)
+    folder = folder_from_text(text, folders)
+    if not folder and action.stage == "folder_input":
+        # Пользователю задали прямой вопрос «напишите папку» — берём текст как есть.
+        folder = clean_folder(text)
+    folder = _match_folder(folder, folders)
+
+    if not folder:
+        await message.answer(
+            "Не понял папку. Выберите вариант кнопкой выше или напишите название, "
+            "например «Люди»."
+        )
+        return
+
+    memory.drop_action(chat_id)
+    choice = await _resolve_folder(obsidian, settings, action, folder)
+    if choice.action is None:
+        await message.answer(choice.text)
+    else:
+        sent = await message.answer(choice.text, reply_markup=choice.keyboard)
+        memory.set_action(chat_id, choice.action, sent.message_id)
+
+
+def _match_folder(name: str, folders: list[str]) -> str:
+    """Существующее написание папки, если имя совпало без учёта регистра."""
+    for folder in folders:
+        if folder.casefold() == name.casefold():
+            return folder
+    return name
+
+
 async def _pending(callback: CallbackQuery, memory: ChatMemory) -> PendingAction | None:
     """Достаёт ожидающее предложение и сообщает, если кнопка устарела."""
     if callback.message is None:
@@ -1412,9 +1519,10 @@ def _preview(text: str) -> str:
 def _proposal_text(proposal: Proposal, links: tuple[str, ...] = ()) -> str:
     hint = _links_line(links)
     if proposal.kind == "create":
+        folder = f"\n\nПапка: {proposal.folder}" if proposal.folder else ""
         return (
             f"Предлагаю заметку «{proposal.title}»:\n\n"
-            f"{_preview(proposal.content)}{hint}\n\nКуда сохранить?"
+            f"{_preview(proposal.content)}{folder}{hint}\n\nКуда сохранить?"
         )
     if proposal.kind == "append":
         where = (
@@ -1446,15 +1554,27 @@ def _links_text(path: str, links: tuple[str, ...]) -> str:
     return f"Связи для «{path}»:\n\n{lines}\n\nДобавить их в раздел «Связи»?"
 
 
-def _folder_keyboard(settings: Settings) -> InlineKeyboardMarkup:
+def _folder_keyboard(
+    settings: Settings, suggestions: tuple[str, ...] | list[str] = ()
+) -> InlineKeyboardMarkup:
+    """Кнопки папок: подсказки сразу, затем стандартные варианты."""
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text=_button_label(folder), callback_data=f"act:folder:{index}"
+            )
+        ]
+        for index, folder in enumerate(suggestions[:MAX_FOLDER_CHOICES])
+    ]
     folder = settings.agent_default_folder
     label = "Inbox" if folder == "Inbox" else f"Inbox ({_button_label(folder)})"
-    rows = [[InlineKeyboardButton(text=label, callback_data="act:inbox")]]
+    rows.append([InlineKeyboardButton(text=label, callback_data="act:inbox")])
     if settings.agent_auto_folder:
         rows.append(
             [InlineKeyboardButton(text="Автоопределение", callback_data="act:auto")]
         )
     rows.append([InlineKeyboardButton(text="Другая папка", callback_data="act:other")])
+    rows.append([InlineKeyboardButton(text="Отмена", callback_data="act:no")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
