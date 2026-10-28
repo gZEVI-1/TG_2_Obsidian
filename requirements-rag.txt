@@ -1,0 +1,4 @@
+# Дополнительные зависимости для семантического поиска (RAG, Этап 8).
+# Базовый бот работает без них: pip install -r requirements.txt
+sentence-transformers>=6,<7
+numpy>=2,<3

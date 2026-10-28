@@ -1,4 +1,4 @@
-"""Точка входа: python -m app [--check-config | --check-obsidian | --check-llm]."""
+"""Точка входа: python -m app [--check-config | --check-obsidian | --check-llm | --check-rag]."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import logging
 import aiohttp
 
 from app.bot import run_bot
-from app.config import Settings, load_settings
+from app.config import PROJECT_ROOT, Settings, load_settings
 from app.llm import LLMError, LLMPool
 from app.logging_setup import setup_logging
 from app.obsidian import ObsidianError, create_obsidian_client
@@ -68,6 +68,11 @@ def parse_args() -> argparse.Namespace:
         "--check-llm",
         action="store_true",
         help="проверить LLM: ответ, tool-calls и состояние пула аккаунтов",
+    )
+    group.add_argument(
+        "--check-rag",
+        action="store_true",
+        help="проверить RAG: модель эмбеддингов, индекс и семантический поиск",
     )
     return parser.parse_args()
 
@@ -147,6 +152,41 @@ async def check_llm(settings: Settings) -> None:
             log.warning("LLM-пул: лимиты исчерпаны, автосброс позже")
 
 
+async def check_rag(settings: Settings) -> None:
+    """Проверяет модель эмбеддингов и обновляет индекс (первый раз — долго)."""
+    try:
+        from app.rag import LocalEmbedder, SemanticSearch, store_dir
+    except ImportError as error:
+        log.error(
+            "RAG недоступен: %s. Установите зависимости: "
+            "pip install -r requirements-rag.txt",
+            error,
+        )
+        raise SystemExit(2) from error
+
+    target = settings.obsidian_vault_path or settings.obsidian_base_url
+    semantic = SemanticSearch(
+        LocalEmbedder(settings.rag_model),
+        store_dir(PROJECT_ROOT, target),
+        exclude_folder=settings.agent_template_folder,
+        exclude_note=settings.agent_style_note,
+    )
+    async with create_obsidian_client(settings) as client:
+        stats = await semantic.refresh(client)
+        log.info(
+            "RAG-индекс: заметок %d, фрагментов %d, обновлено %d, ошибок %d",
+            stats.notes,
+            stats.chunks,
+            stats.updated,
+            stats.failed,
+        )
+        hits = await semantic.search("проверка семантического поиска", limit=3)
+        if not hits:
+            log.warning("RAG: поиск ничего не нашёл — индекс пуст?")
+        for hit in hits:
+            log.info("  %s (%s): %s", hit["path"], hit["score"], hit["excerpt"][:80])
+
+
 def main() -> None:
     # Логирование включаем до чтения настроек, чтобы предупреждение
     # о недостающем .env тоже попало в лог. Уровень уточняем после.
@@ -198,6 +238,10 @@ def main() -> None:
                 error,
             )
             raise SystemExit(2) from error
+        return
+
+    if args.check_rag:
+        asyncio.run(check_rag(settings))
         return
 
     if not settings.telegram_bot_token:

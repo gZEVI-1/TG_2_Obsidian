@@ -194,6 +194,7 @@ class Agent:
         settings: Settings,
         *,
         style: str = "",
+        semantic: Any = None,
     ) -> None:
         self._llm = llm
         self._obsidian = obsidian
@@ -201,6 +202,8 @@ class Agent:
         self._template_folder = settings.agent_template_folder
         self._style_note = settings.agent_style_note
         self._link_limit = settings.agent_link_limit
+        self._rag_limit = settings.rag_top_k
+        self._semantic = semantic
         self._style = style.strip()[:4000]
         self.system_prompt = build_system_prompt(self._style)
 
@@ -607,9 +610,6 @@ class Agent:
         except ObsidianError as error:
             return f"Ошибка поиска: {error}"
 
-        if not hits:
-            return "Ничего не найдено."
-
         lines = []
         for hit in hits:
             if hit["match"] == "имя":
@@ -618,7 +618,36 @@ class Agent:
                 lines.append(f"- {hit['path']} (похожее название)")
             else:
                 lines.append(f"- {hit['path']}: {hit['excerpt'][:160]}")
+
+        lines.extend(await self._semantic_lines(query, hits))
+        if not lines:
+            return "Ничего не найдено."
         return "\n".join(lines)
+
+    async def _semantic_lines(
+        self, query: str, hits: list[dict[str, str]]
+    ) -> list[str]:
+        """Добивает поиск совпадениями по смыслу, если место ещё осталось."""
+        if self._semantic is None or len(hits) >= self._search_limit:
+            return []
+        known = {hit.get("path", "") for hit in hits}
+        try:
+            semantic = await self._semantic.search(
+                query, limit=self._search_limit - len(hits)
+            )
+        except Exception as error:  # RAG необязателен: обычный поиск не страдает
+            log.warning("RAG: семантический поиск не удался: %s", error)
+            return []
+
+        lines = []
+        for hit in semantic:
+            path = hit.get("path", "")
+            if not path or path in known:
+                continue
+            known.add(path)
+            excerpt = (hit.get("excerpt") or "").strip().replace("\n", " ")[:160]
+            lines.append(f"- {path}: {excerpt} (по смыслу)")
+        return lines
 
     async def _notes(self, folder: str) -> str:
         """Заметки в папке или во всём хранилище — для выбора точного пути."""

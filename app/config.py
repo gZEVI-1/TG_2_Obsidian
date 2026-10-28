@@ -27,6 +27,8 @@ DEFAULT_LLM_STUB_RESET_SECONDS = 60
 
 DEFAULT_LINK_LIMIT = 10
 MAX_LINK_LIMIT = 50
+DEFAULT_RAG_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+DEFAULT_RAG_TOP_K = 5
 
 # Порядок = качество: первая модель лучшая, последняя — запасная.
 # Список используется только в режиме заглушек, пока нет реальных API.
@@ -83,6 +85,9 @@ class Settings:
     agent_style_note: str = ""
     agent_auto_link: bool = True
     agent_link_limit: int = DEFAULT_LINK_LIMIT
+    rag_enabled: bool = True
+    rag_model: str = DEFAULT_RAG_MODEL
+    rag_top_k: int = DEFAULT_RAG_TOP_K
 
     @property
     def effective_obsidian_mode(self) -> str:
@@ -133,6 +138,9 @@ class Settings:
             "agent_style_note": self.agent_style_note or "<не задан>",
             "agent_auto_link": str(self.agent_auto_link).lower(),
             "agent_link_limit": str(self.agent_link_limit),
+            "rag_enabled": str(self.rag_enabled).lower(),
+            "rag_model": self.rag_model or "<не задана>",
+            "rag_top_k": str(self.rag_top_k),
             "log_level": self.log_level,
         }
 
@@ -378,4 +386,7 @@ def load_settings() -> Settings:
             minimum=1,
             maximum=MAX_LINK_LIMIT,
         ),
+        rag_enabled=_env_bool("RAG_ENABLED", default=True),
+        rag_model=_env_str("RAG_MODEL", DEFAULT_RAG_MODEL),
+        rag_top_k=_env_int("RAG_TOP_K", default=DEFAULT_RAG_TOP_K, minimum=1, maximum=20),
     )

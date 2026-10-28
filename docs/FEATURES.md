@@ -299,6 +299,9 @@
 | `AGENT_LINK_LIMIT` | целое, 1–50 | `10` | 7 |
 | `AGENT_TEMPLATE_FOLDER` | путь папки | `Templates` | 6 |
 | `AGENT_STYLE_NOTE` | путь к `.md` | пусто | 6 |
+| `RAG_ENABLED` | `true`, `false` | `true` | 8 |
+| `RAG_MODEL` | имя модели sentence-transformers | `paraphrase-multilingual-MiniLM-L12-v2` | 8 |
+| `RAG_TOP_K` | целое, 1–20 | `5` | 8 |
 
 Неверные значения валидируются при загрузке настроек: опечатка должна
 проявляться сразу, а не молча подставляться.

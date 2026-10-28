@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
+from contextlib import suppress
 from dataclasses import dataclass, replace
+from typing import Any
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
@@ -21,7 +24,7 @@ from aiogram.types import (
 )
 
 from app.agent import Agent, Proposal
-from app.config import Settings
+from app.config import PROJECT_ROOT, Settings
 from app.links import (
     add_links,
     duplicate_titles,
@@ -104,6 +107,8 @@ COMMANDS = [
     BotCommand(command="new", description="Новый диалог"),
     BotCommand(command="folders", description="Папки хранилища"),
     BotCommand(command="links", description="Связи во всех заметках"),
+    BotCommand(command="rag", description="Состояние семантического поиска"),
+    BotCommand(command="reindex", description="Обновить RAG-индекс"),
     BotCommand(command="llm", description="Состояние LLM-пула"),
     BotCommand(command="llm_reset", description="Сбросить лимиты LLM"),
 ]
@@ -140,8 +145,11 @@ HELP_TEXT = (
     "подтверждения.\n\n"
     "Связи появляются в разделе «Связи»: при создании заметки бот предлагает "
     "их кнопкой, а в существующей — по просьбе «свяжи заметку…».\n\n"
-    "Команды: /start, /help, /new, /folders, /links, /llm — состояние моделей "
-    "и лимитов."
+    "Поиск понимает смысл: «что я писал про сроки релиза» найдёт заметку, "
+    "даже если таких слов в ней нет. /rag — состояние индекса, /reindex — "
+    "пересобрать после больших правок.\n\n"
+    "Команды: /start, /help, /new, /folders, /links, /rag, /reindex, /llm — "
+    "состояние моделей и лимитов."
 )
 
 
@@ -288,6 +296,70 @@ async def cmd_llm(message: Message, llm: LLMPool, memory: ChatMemory) -> None:
         _llm_status_text(llm.status()),
         reply_markup=_keyboard_for(message.chat.id, memory),
     )
+
+
+@router.message(Command("rag"))
+async def cmd_rag(
+    message: Message, memory: ChatMemory, semantic: Any
+) -> None:
+    """Состояние семантического поиска: модель, размер индекса, когда обновлён."""
+    await message.answer(
+        _rag_status_text(semantic),
+        reply_markup=_keyboard_for(message.chat.id, memory),
+    )
+
+
+@router.message(Command("reindex"))
+async def cmd_reindex(
+    message: Message,
+    memory: ChatMemory,
+    obsidian: ObsidianBackend,
+    semantic: Any,
+) -> None:
+    """Обновляет RAG-индекс: первый запуск строит его с нуля."""
+    keyboard = _keyboard_for(message.chat.id, memory)
+    if semantic is None:
+        await message.answer(_rag_status_text(None), reply_markup=keyboard)
+        return
+
+    status = await message.answer(
+        "Обновляю RAG-индекс: читаю заметки и считаю эмбеддинги…"
+    )
+    try:
+        stats = await semantic.refresh(obsidian)
+    except Exception as error:  # индекс необязателен: бот продолжает работать
+        log.error("RAG: индекс не обновлён: %s", error)
+        await status.edit_text(
+            f"Не удалось обновить индекс: {error}", reply_markup=keyboard
+        )
+        return
+
+    await status.edit_text(
+        "RAG-индекс готов.\n"
+        f"Заметок: {stats.notes}, фрагментов: {stats.chunks}.\n"
+        f"Обновлено: {stats.updated}, без изменений: {stats.skipped}, "
+        f"удалено: {stats.removed}, ошибок: {stats.failed}.",
+        reply_markup=keyboard,
+    )
+
+
+def _rag_status_text(semantic: Any) -> str:
+    """Сводка RAG для пользователя."""
+    if semantic is None:
+        return (
+            "Семантический поиск выключен: нет RAG-зависимостей или "
+            "RAG_ENABLED=false. Установите `requirements-rag.txt` "
+            "и перезапустите бота."
+        )
+    lines = [
+        f"RAG: модель {semantic.model_name}",
+        f"В индексе: заметок — {semantic.notes}, фрагментов — {semantic.chunks}",
+    ]
+    if semantic.updated_at:
+        lines.append(f"Обновлён: {semantic.updated_at}")
+    else:
+        lines.append("Индекс ещё не построен — выполните /reindex")
+    return "\n".join(lines)
 
 
 # Кнопки клавиатуры дублируют команды точным совпадением текста: модель
@@ -1951,12 +2023,60 @@ async def _load_style(obsidian: ObsidianBackend, settings: Settings) -> str:
     return style
 
 
+def _create_semantic(settings: Settings) -> Any:
+    """Семантический поиск; без RAG-зависимостей — None, работает как раньше."""
+    if not settings.rag_enabled:
+        log.info("RAG выключен: RAG_ENABLED=false")
+        return None
+
+    try:
+        from app.rag import LocalEmbedder, SemanticSearch, store_dir
+    except ImportError as error:
+        log.warning(
+            "RAG выключен: %s. Установите зависимости: "
+            "pip install -r requirements-rag.txt",
+            error,
+        )
+        return None
+
+    target = settings.obsidian_vault_path or settings.obsidian_base_url
+    index_dir = store_dir(PROJECT_ROOT, target)
+    semantic = SemanticSearch(
+        LocalEmbedder(settings.rag_model),
+        index_dir,
+        exclude_folder=settings.agent_template_folder,
+        exclude_note=settings.agent_style_note,
+    )
+    log.info("RAG: модель %s, индекс %s", settings.rag_model, index_dir)
+    return semantic
+
+
+async def _refresh_rag(semantic: Any, obsidian: ObsidianBackend) -> None:
+    """Фоновое обновление индекса при старте: запуск бота не задерживается."""
+    try:
+        await semantic.refresh(obsidian)
+    except Exception as error:  # индекс необязателен: бот продолжает работать
+        log.warning("RAG: индекс не обновлён: %s", error)
+
+
 async def run_bot(settings: Settings) -> None:
     """Запускает бота и блокируется до остановки (Ctrl+C)."""
     pool = LLMPool(settings)
     obsidian = create_obsidian_client(settings)
-    agent = Agent(pool, obsidian, settings, style=await _load_style(obsidian, settings))
+    semantic = _create_semantic(settings)
+    agent = Agent(
+        pool,
+        obsidian,
+        settings,
+        style=await _load_style(obsidian, settings),
+        semantic=semantic,
+    )
     template_files = await _load_template_files(obsidian, settings)
+    rag_task = (
+        asyncio.create_task(_refresh_rag(semantic, obsidian))
+        if semantic is not None
+        else None
+    )
     memory = ChatMemory()
     bot = Bot(token=settings.telegram_bot_token)
     dispatcher = Dispatcher()
@@ -1979,8 +2099,13 @@ async def run_bot(settings: Settings) -> None:
             settings=settings,
             llm=pool,
             template_files=template_files,
+            semantic=semantic,
         )
     finally:
+        if rag_task is not None:
+            rag_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await rag_task
         await pool.close()
         await obsidian.close()
         await bot.session.close()
