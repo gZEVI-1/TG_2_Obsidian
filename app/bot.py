@@ -28,11 +28,16 @@ from app.notes import (
     append_to_section,
     build_path,
     contains_text,
+    find_section,
     replace_section,
     sections,
     validate_path,
 )
-from app.obsidian import ObsidianClient, ObsidianError
+from app.obsidian import (
+    ObsidianBackend,
+    ObsidianError,
+    create_obsidian_client,
+)
 
 log = logging.getLogger(__name__)
 
@@ -329,14 +334,14 @@ async def answer_text(
     agent: Agent,
     memory: ChatMemory,
     settings: Settings,
-    obsidian: ObsidianClient,
+    obsidian: ObsidianBackend,
 ) -> None:
     chat_id = message.chat.id
     text = message.text or ""
 
     flow = memory.get_flow(chat_id)
     if flow is not None:
-        await _handle_flow(message, memory, settings, obsidian, flow)
+        await _handle_flow(message, agent, memory, settings, obsidian, flow)
         return
 
     pending = memory.get_action_any(chat_id)
@@ -376,6 +381,16 @@ async def answer_text(
         await _offer(message, memory, settings, obsidian, result.proposal)
         return
 
+    if result.clarify:
+        memory.set_page(chat_id, "scenarios")
+        memory.add(chat_id, text, result.text)
+        await message.answer(
+            result.text
+            + "\n\nВыберите действие кнопкой ниже или сформулируйте иначе.",
+            reply_markup=KEYBOARD_SCENARIOS,
+        )
+        return
+
     memory.add(chat_id, text, result.text)
     await message.answer(
         result.text or "Модель вернула пустой ответ.",
@@ -387,7 +402,7 @@ async def _offer(
     message: Message,
     memory: ChatMemory,
     settings: Settings,
-    obsidian: ObsidianClient,
+    obsidian: ObsidianBackend,
     proposal: Proposal,
 ) -> None:
     chat_id = message.chat.id
@@ -422,32 +437,46 @@ def _flow_cancel_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def _split_title(text: str) -> tuple[str, str]:
-    """Заголовок новой заметки — первая непустая строка текста."""
-    for line in text.splitlines():
-        title = line.strip().lstrip("#").strip()
-        if title:
-            return title[: MAX_BUTTON_CHARS * 2], text.strip()
-    return "Без названия", text.strip()
+def _section_text(note: str, heading: str) -> str:
+    """Текст раздела по заголовку; пусто, если раздела нет."""
+    span = find_section(note, heading)
+    if span is None:
+        return note[-2000:]
+    lines = note.splitlines()
+    return "\n".join(lines[span.start : span.end]).strip()
 
 
 async def _handle_flow(
     message: Message,
+    agent: Agent,
     memory: ChatMemory,
     settings: Settings,
-    obsidian: ObsidianClient,
+    obsidian: ObsidianBackend,
     flow: Flow,
 ) -> None:
-    """Продолжает пошаговый сценарий, запущенный кнопкой."""
+    """Продолжает пошаговый сценарий, запущенный кнопкой.
+
+    Текст пользователя в любом сценарии проходит через модель: она
+    переписывает его так, чтобы он хорошо лёг в заметку.
+    """
     chat_id = message.chat.id
     text = (message.text or "").strip()
+    keyboard = _keyboard_for(chat_id, memory)
 
     if flow.kind == "create" and flow.step == "text":
         memory.clear_flow(chat_id)
         if not text:
-            await message.answer("Пусто — пришлите текст заметки.")
+            await message.answer("Пусто — пришлите текст заметки.", reply_markup=keyboard)
             return
-        title, content = _split_title(text)
+        try:
+            title, content = await agent.compose_note(text)
+        except LLMError as error:
+            log.error("Не удалось оформить заметку: %s", error)
+            await message.answer(
+                "Не смог обработать текст: " + _llm_error_text(error),
+                reply_markup=keyboard,
+            )
+            return
         await _offer(
             message,
             memory,
@@ -464,20 +493,45 @@ async def _handle_flow(
     if flow.step == "content":
         memory.clear_flow(chat_id)
         if not text:
-            await message.answer("Пусто — пришлите текст.")
+            await message.answer("Пусто — пришлите текст.", reply_markup=keyboard)
             return
-        if flow.kind == "append":
-            proposal = Proposal(
-                kind="append", path=flow.path, heading=flow.section, content=text
+        try:
+            note = await obsidian.read_note(flow.path)
+        except (ObsidianError, aiohttp.ClientError) as error:
+            await message.answer(_obsidian_error_text(error), reply_markup=keyboard)
+            return
+
+        section_text = _section_text(note, flow.section) if flow.section else note
+        try:
+            if flow.kind == "append":
+                composed = await agent.compose_append(
+                    flow.path, flow.section, section_text, text
+                )
+                proposal = Proposal(
+                    kind="append",
+                    path=flow.path,
+                    heading=flow.section,
+                    content=composed,
+                )
+            else:
+                composed = await agent.compose_section(
+                    flow.path, flow.section, section_text, text
+                )
+                proposal = Proposal(
+                    kind="section",
+                    path=flow.path,
+                    heading=flow.section,
+                    mode="replace",
+                    content=composed,
+                )
+        except LLMError as error:
+            log.error("Не удалось обработать текст: %s", error)
+            await message.answer(
+                "Не смог обработать текст: " + _llm_error_text(error),
+                reply_markup=keyboard,
             )
-        else:
-            proposal = Proposal(
-                kind="section",
-                path=flow.path,
-                heading=flow.section,
-                mode="replace",
-                content=text,
-            )
+            return
+
         await _offer(message, memory, settings, obsidian, proposal)
         return
 
@@ -490,7 +544,7 @@ async def _handle_flow(
 async def _flow_search(
     message: Message,
     memory: ChatMemory,
-    obsidian: ObsidianClient,
+    obsidian: ObsidianBackend,
     flow: Flow,
     query: str,
 ) -> None:
@@ -542,7 +596,7 @@ async def _flow_search(
 async def _flow_pick(
     message: Message,
     memory: ChatMemory,
-    obsidian: ObsidianClient,
+    obsidian: ObsidianBackend,
     flow: Flow,
     path: str,
 ) -> None:
@@ -624,7 +678,7 @@ async def on_flow_cancel(callback: CallbackQuery, memory: ChatMemory) -> None:
 
 @router.callback_query(F.data.startswith("flow:note:"))
 async def on_flow_note(
-    callback: CallbackQuery, memory: ChatMemory, obsidian: ObsidianClient
+    callback: CallbackQuery, memory: ChatMemory, obsidian: ObsidianBackend
 ) -> None:
     await callback.answer()
     flow = await _active_flow(callback, memory, "pick_note")
@@ -677,7 +731,7 @@ async def on_inbox(
     callback: CallbackQuery,
     memory: ChatMemory,
     settings: Settings,
-    obsidian: ObsidianClient,
+    obsidian: ObsidianBackend,
 ) -> None:
     await callback.answer()
     action = await _pending(callback, memory)
@@ -711,7 +765,7 @@ async def on_auto(
     agent: Agent,
     memory: ChatMemory,
     settings: Settings,
-    obsidian: ObsidianClient,
+    obsidian: ObsidianBackend,
 ) -> None:
     await callback.answer("Подбираю папку…")
     action = await _pending(callback, memory)
@@ -777,7 +831,7 @@ async def on_folder(
     callback: CallbackQuery,
     memory: ChatMemory,
     settings: Settings,
-    obsidian: ObsidianClient,
+    obsidian: ObsidianBackend,
 ) -> None:
     await callback.answer()
     action = await _pending(callback, memory)
@@ -796,7 +850,7 @@ async def on_folder(
 
 @router.callback_query(F.data == "act:yes")
 async def on_yes(
-    callback: CallbackQuery, memory: ChatMemory, obsidian: ObsidianClient
+    callback: CallbackQuery, memory: ChatMemory, obsidian: ObsidianBackend
 ) -> None:
     await callback.answer("Записываю…")
     action = await _pending(callback, memory)
@@ -820,7 +874,7 @@ async def on_no(callback: CallbackQuery, memory: ChatMemory) -> None:
 
 @router.callback_query(F.data == "act:append")
 async def on_append(
-    callback: CallbackQuery, memory: ChatMemory, obsidian: ObsidianClient
+    callback: CallbackQuery, memory: ChatMemory, obsidian: ObsidianBackend
 ) -> None:
     await callback.answer("Дописываю…")
     action = await _pending(callback, memory)
@@ -857,7 +911,7 @@ class Choice:
 
 
 async def _resolve_folder(
-    obsidian: ObsidianClient,
+    obsidian: ObsidianBackend,
     settings: Settings,
     action: PendingAction,
     folder: str,
@@ -914,7 +968,7 @@ async def _show_choice(
 
 
 async def _apply(
-    obsidian: ObsidianClient, proposal: Proposal, path: str
+    obsidian: ObsidianBackend, proposal: Proposal, path: str
 ) -> str:
     """Выполняет предложение и возвращает текст результата для пользователя."""
     if proposal.kind == "create":
@@ -1137,7 +1191,7 @@ def _obsidian_error_text(error: Exception) -> str:
 async def run_bot(settings: Settings) -> None:
     """Запускает бота и блокируется до остановки (Ctrl+C)."""
     pool = LLMPool(settings)
-    obsidian = ObsidianClient(settings)
+    obsidian = create_obsidian_client(settings)
     agent = Agent(pool, obsidian, settings)
     memory = ChatMemory()
     bot = Bot(token=settings.telegram_bot_token)

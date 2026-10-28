@@ -1,5 +1,8 @@
 # Этап 3: Клиент Obsidian Local REST API
 
+> Дополнено ADR-26: появился файловый режим без запущенного Obsidian —
+> см. [06_vault_mode.md](06_vault_mode.md).
+
 ## Этап
 
 Этап 3 — асинхронный клиент Obsidian Local REST API: проверка соединения, чтение

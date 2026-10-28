@@ -8,10 +8,11 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from app.actions import prompt_block, tools as build_tools, write_actions
 from app.config import Settings
-from app.llm import ChatClient, ToolCall
+from app.llm import ChatClient, LLMError, ToolCall
 from app.notes import slugify, validate_path
-from app.obsidian import ObsidianClient, ObsidianError
+from app.obsidian import ObsidianBackend, ObsidianError
 
 log = logging.getLogger(__name__)
 
@@ -19,161 +20,77 @@ MAX_STEPS = 6
 MAX_NOTE_CHARS = 4000
 MAX_SUGGESTED_FOLDERS = 3
 
-SYSTEM_PROMPT = (
+BASE_PROMPT = (
     "Ты живой и дружелюбный помощник в Telegram. Работаешь с хранилищем Obsidian "
     "пользователя и говоришь по-русски просто, по-человечески: без канцелярита, "
-    "длинных списков и служебных фраз вроде «выполняю запрос».\n\n"
-    "ТВОИ КОМАНДЫ (они же инструменты). Пользователь может назвать их, а может "
-    "просто описать словами — тогда выбери подходящую сам:\n"
-    "1. search_notes(query) — найти заметки: по именам (точно и с опечатками) "
-    "и по тексту.\n"
-    "2. list_folders() — какие папки есть в хранилище.\n"
-    "3. read_note(path) — прочитать или пересказать заметку.\n"
-    "4. create_note(title, content) — сохранить новую мысль или текст в новую "
-    "заметку.\n"
-    "5. append_note(path, content, section) — дописать в существующую заметку; "
-    "section — раздел, к которому текст относится по смыслу.\n"
-    "6. edit_section(path, heading, content, mode) — заменить (mode=replace) "
-    "или дополнить (mode=append) раздел заметки.\n\n"
-    "КАК РАЗБИРАТЬ ПРОСЬБУ:\n"
-    "- Мысленно раздели сообщение на три части: ЧТО сделать (команда из списка), "
-    "ГДЕ (заметка, папка, раздел) и КАКОЙ текст (содержание).\n"
+    "длинных списков и служебных фраз вроде «выполняю запрос»."
+)
+
+PARSE_RULES = (
+    "\n\nКАК РАЗБИРАТЬ ПРОСЬБУ:\n"
+    "- Всегда сам определи команду по смыслу: пользователь не обязан её называть. "
+    "«запиши…», «добавь…», «поправь…», «что там про…» — сопоставь с командами "
+    "из списка выше.\n"
+    "- Раздели просьбу на три части: ЧТО сделать, ГДЕ (заметка, папка, раздел) "
+    "и КАКОЙ текст.\n"
     "- Помни контекст диалога: «сохрани это», «допиши туда», «поправь его» "
-    "относятся к тому, о чём говорили выше.\n"
-    "- Команда может быть не названа: «запиши…», «добавь…», «поправь…», "
-    "«что там про…» — сам сопоставь с командами из списка.\n"
-    "- Если подходят несколько команд, или непонятно место, или в заметке "
-    "несколько разделов — задай один короткий вопрос и ничего не меняй.\n"
+    "относятся к сказанному выше.\n"
+    "- Если подходят несколько команд или неясно место — вызови clarify, задай "
+    "один короткий вопрос и ничего не меняй.\n"
+    "- Если запрос не подходит ни под одну команду — тоже clarify: попроси "
+    "указать действие явно.\n"
     "- Не выдумывай пути и содержимое: не знаешь — сначала search_notes или "
-    "list_folders.\n\n"
-    "КАК ПИСАТЬ ТЕКСТ ЗАМЕТКИ:\n"
-    "- Из короткого сообщения в Telegram делай полноценную заметку: заголовок, "
-    "структура, развёрнутые формулировки, понятные через месяц.\n"
-    "- Не копируй сообщение дословно: переформулируй и разверни, сохранив смысл.\n"
-    "- Расширяй за счёт ясности и структуры, а не выдуманных фактов: чего не "
-    "сказано — того не придумывай.\n"
+    "list_folders."
+)
+
+WRITE_RULES = (
+    "\n\nКАК ПИСАТЬ ТЕКСТ ЗАМЕТКИ (всегда — и при создании, и при дописывании):\n"
+    "- Продумай, как текст ляжет в заметку: место, раздел, формат (абзац, "
+    "список, таблица).\n"
+    "- Перепиши сообщение: убери разговорность, добавь структуру и ясность, "
+    "сохранив смысл. Не вставляй сообщение дословно.\n"
+    "- При дописывании учитывай уже написанное: не повторяй, продолжай мысль "
+    "в том же тоне и формате.\n"
+    "- Расширяй за счёт ясности, а не выдуманных фактов.\n"
     "- Если пользователь дал готовый текст и просит сохранить как есть — "
-    "уважай это.\n\n"
+    "сохрани как есть.\n\n"
     "ПРАВИЛА РАБОТЫ:\n"
-    "1. Перед дописыванием или правкой прочитай заметку (read_note) и выбери "
-    "раздел по смыслу; если подходящего нет — оставь section пустым.\n"
-    "2. Не дублируй: если такой текст в заметке уже есть, скажи об этом.\n"
+    "1. Перед дописыванием или правкой прочитай заметку (read_note).\n"
+    "2. Не дублируй: если такой текст уже есть, скажи об этом.\n"
     "3. Создание и изменение подтверждает пользователь: готовь текст и коротко "
     "объясни, что предлагаешь.\n"
-    "4. Пути — относительно корня хранилища, с расширением .md.\n"
+    "4. Пути — относительно корня хранилища, с .md.\n"
     "5. Отвечай коротко и по делу."
 )
 
-TOOLS: list[dict[str, Any]] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "search_notes",
-            "description": (
-                "Найти заметки по словам: сначала имена файлов (в том числе "
-                "с опечатками), затем содержимое."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Ключевые слова для поиска"}
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_folders",
-            "description": "Список папок хранилища Obsidian.",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_note",
-            "description": "Прочитать заметку целиком (длинная обрезается).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Путь относительно корня хранилища, например «Проекты/Идея.md»",
-                    }
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "create_note",
-            "description": (
-                "Предложить новую заметку. Папку выберет пользователь, поэтому путь "
-                "не передавай — только заголовок и текст."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "title": {"type": "string", "description": "Заголовок и имя файла"},
-                    "content": {"type": "string", "description": "Полный текст в Markdown"},
-                },
-                "required": ["title", "content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "append_note",
-            "description": (
-                "Предложить дописать текст в существующую заметку. Сначала прочитай "
-                "заметку и укажи раздел, к которому текст относится по смыслу."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Путь существующей заметки"},
-                    "content": {"type": "string", "description": "Текст, который нужно дописать"},
-                    "section": {
-                        "type": "string",
-                        "description": (
-                            "Заголовок раздела без решёток, в конец которого дописать. "
-                            "Пусто — дописать в конец заметки."
-                        ),
-                    },
-                },
-                "required": ["path", "content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "edit_section",
-            "description": "Предложить заменить или дополнить раздел заметки по заголовку.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Путь существующей заметки"},
-                    "heading": {"type": "string", "description": "Заголовок раздела без решёток"},
-                    "content": {"type": "string", "description": "Новое содержимое раздела"},
-                    "mode": {
-                        "type": "string",
-                        "enum": ["replace", "append"],
-                        "description": "replace — заменить раздел, append — дописать в конец",
-                    },
-                },
-                "required": ["path", "heading", "content", "mode"],
-            },
-        },
-    },
-]
+SYSTEM_PROMPT = BASE_PROMPT + "\n\n" + prompt_block() + PARSE_RULES + WRITE_RULES
 
-TERMINAL_TOOLS = ("create_note", "append_note", "edit_section")
+COMPOSE_NOTE_PROMPT = (
+    "Оформи заметку для Obsidian по сообщению пользователя.\n"
+    "Верни только Markdown: первая строка — заголовок вида «# ...», дальше текст. "
+    "Сохрани смысл, разверни формулировки и добавь структуру, если уместно. "
+    "Не выдумывай факты.\n\n"
+    "Сообщение:\n{text}"
+)
+
+COMPOSE_APPEND_PROMPT = (
+    "Допиши фрагмент в раздел «{section}» заметки «{path}».\n\n"
+    "Сейчас в разделе:\n{section_text}\n\n"
+    "Сообщение пользователя:\n{text}\n\n"
+    "Верни только текст для добавления: в том же стиле и формате, без заголовка "
+    "раздела и без повторения уже написанного."
+)
+
+COMPOSE_SECTION_PROMPT = (
+    "Замени содержимое раздела «{section}» заметки «{path}».\n\n"
+    "Сейчас в разделе:\n{section_text}\n\n"
+    "Пожелание пользователя:\n{text}\n\n"
+    "Верни только новое содержимое раздела, без строки заголовка."
+)
+
+TOOLS: list[dict[str, Any]] = build_tools()
+
+TERMINAL_TOOLS = write_actions()
 
 FOLDER_PROMPT = (
     "Разложи заметку по папкам хранилища Obsidian.\n\n"
@@ -203,12 +120,13 @@ class AgentResult:
 
     text: str
     proposal: Proposal | None = None
+    clarify: bool = False
 
 
 class Agent:
     """Один ход диалога: модель ищет, читает и предлагает изменения."""
 
-    def __init__(self, llm: ChatClient, obsidian: ObsidianClient, settings: Settings) -> None:
+    def __init__(self, llm: ChatClient, obsidian: ObsidianBackend, settings: Settings) -> None:
         self._llm = llm
         self._obsidian = obsidian
         self._search_limit = settings.agent_search_limit
@@ -217,13 +135,24 @@ class Agent:
         """Крутит цикл инструментов, пока модель не ответит текстом.
 
         Инструменты изменения завершают ход: запись выполняет бот после
-        решения пользователя.
+        решения пользователя. `clarify` тоже завершает ход — бот показывает
+        вопрос и кнопки с командами.
         """
         for _ in range(MAX_STEPS):
             response = await self._llm.chat(messages, tools=TOOLS)
 
             if not response.tool_calls:
                 return AgentResult(text=response.text)
+
+            clarify = next(
+                (call for call in response.tool_calls if call.name == "clarify"),
+                None,
+            )
+            if clarify is not None:
+                question = _argument(clarify.arguments, "question") or (
+                    "Уточните, пожалуйста, что нужно сделать."
+                )
+                return AgentResult(text=question, clarify=True)
 
             change = next(
                 (call for call in response.tool_calls if call.name in TERMINAL_TOOLS),
@@ -270,6 +199,50 @@ class Agent:
                 result.append(folder)
             if len(result) >= MAX_SUGGESTED_FOLDERS:
                 break
+        return result
+
+    async def compose_note(self, text: str) -> tuple[str, str]:
+        """Разворачивает сообщение в заметку: (заголовок, полный текст)."""
+        response = await self._llm.chat(
+            [{"role": "user", "content": COMPOSE_NOTE_PROMPT.format(text=text)}],
+            max_tokens=900,
+        )
+        content = response.text.strip()
+        if not content:
+            raise LLMError("Модель вернула пустой текст заметки.")
+        return _split_note(content)
+
+    async def compose_append(
+        self, path: str, section: str, section_text: str, text: str
+    ) -> str:
+        """Переписывает фрагмент так, чтобы он хорошо лёг в раздел заметки."""
+        prompt = COMPOSE_APPEND_PROMPT.format(
+            path=path,
+            section=section or "конец заметки",
+            section_text=section_text[-2000:],
+            text=text,
+        )
+        return await self._compose(prompt)
+
+    async def compose_section(
+        self, path: str, section: str, section_text: str, text: str
+    ) -> str:
+        """Пишет новое содержимое раздела по пожеланию пользователя."""
+        prompt = COMPOSE_SECTION_PROMPT.format(
+            path=path,
+            section=section,
+            section_text=section_text[-2000:],
+            text=text,
+        )
+        return await self._compose(prompt)
+
+    async def _compose(self, prompt: str) -> str:
+        response = await self._llm.chat(
+            [{"role": "user", "content": prompt}], max_tokens=700
+        )
+        result = response.text.strip()
+        if not result:
+            raise LLMError("Модель вернула пустой текст.")
         return result
 
     def _proposal(self, call: ToolCall) -> AgentResult:
@@ -380,6 +353,17 @@ class Agent:
         if len(content) > MAX_NOTE_CHARS:
             return content[:MAX_NOTE_CHARS] + "\n\n[текст обрезан]"
         return content
+
+
+def _split_note(content: str) -> tuple[str, str]:
+    """Заголовок заметки — первый «# ...», иначе первая строка."""
+    for line in content.splitlines():
+        if line.startswith("# "):
+            return line[2:].strip()[:80] or "Без названия", content
+    first = next((line.strip() for line in content.splitlines() if line.strip()), "")
+    if not first:
+        return "Без названия", content
+    return first[:80], f"# {first}\n\n{content}"
 
 
 def _clean_folder_line(line: str) -> str:

@@ -12,7 +12,7 @@ from app.bot import run_bot
 from app.config import Settings, load_settings
 from app.llm import LLMError, LLMPool
 from app.logging_setup import setup_logging
-from app.obsidian import ObsidianClient, ObsidianError
+from app.obsidian import ObsidianError, create_obsidian_client
 
 log = logging.getLogger("app")
 
@@ -73,13 +73,20 @@ def parse_args() -> argparse.Namespace:
 
 
 async def check_obsidian(settings: Settings) -> None:
-    async with ObsidianClient(settings) as client:
+    async with create_obsidian_client(settings) as client:
         status = await client.health()
-        log.info(
-            "Local REST API доступен: %s (authenticated=%s)",
-            status.get("service", "?"),
-            status.get("authenticated", "?"),
-        )
+        if settings.obsidian_mode == "vault":
+            log.info(
+                "Хранилище доступно напрямую: %s (writable=%s)",
+                status.get("path", settings.obsidian_vault_path),
+                status.get("writable", "?"),
+            )
+        else:
+            log.info(
+                "Local REST API доступен: %s (authenticated=%s)",
+                status.get("service", "?"),
+                status.get("authenticated", "?"),
+            )
 
         written = await client.write_note(CHECK_NOTE_PATH, CHECK_NOTE_CONTENT, overwrite=True)
         if written:
@@ -161,12 +168,19 @@ def main() -> None:
             log.error("Obsidian: %s", error)
             raise SystemExit(2) from error
         except aiohttp.ClientError as error:
-            log.error(
-                "Не удалось подключиться к %s: %s. Проверьте, что Obsidian запущен "
-                "и сервер Local REST API включён.",
-                settings.obsidian_base_url,
-                error,
-            )
+            if settings.obsidian_mode == "vault":
+                log.error(
+                    "Не удалось прочитать хранилище %s: %s.",
+                    settings.obsidian_vault_path,
+                    error,
+                )
+            else:
+                log.error(
+                    "Не удалось подключиться к %s: %s. Проверьте, что Obsidian "
+                    "запущен и сервер Local REST API включён.",
+                    settings.obsidian_base_url,
+                    error,
+                )
             raise SystemExit(2) from error
         return
 

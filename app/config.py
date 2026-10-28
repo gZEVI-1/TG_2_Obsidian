@@ -73,6 +73,12 @@ class Settings:
     agent_auto_folder: bool
     agent_search_limit: int
     log_level: str
+    obsidian_vault_path: str = ""
+
+    @property
+    def obsidian_mode(self) -> str:
+        """vault — файлы напрямую, rest — Local REST API (нужен запуск Obsidian)."""
+        return "vault" if self.obsidian_vault_path else "rest"
 
     def safe_summary(self) -> dict[str, str]:
         """Безопасное представление настроек для логов: без значений секретов."""
@@ -92,6 +98,12 @@ class Settings:
                 if self.llm_stub
                 else "<не используется>"
             ),
+            "obsidian_mode": (
+                "vault (файлы напрямую)"
+                if self.obsidian_vault_path
+                else "rest (Local REST API)"
+            ),
+            "obsidian_vault_path": self.obsidian_vault_path or "<не задан>",
             "obsidian_base_url": self.obsidian_base_url,
             "obsidian_api_key": _describe_secret(self.obsidian_api_key),
             "obsidian_dry_run": str(self.obsidian_dry_run).lower(),
@@ -304,4 +316,5 @@ def load_settings() -> Settings:
         agent_auto_folder=_env_bool("AGENT_AUTO_FOLDER", default=True),
         agent_search_limit=_env_int("AGENT_SEARCH_LIMIT", default=5, minimum=1, maximum=20),
         log_level=log_level,
+        obsidian_vault_path=_env_str("OBSIDIAN_VAULT_PATH"),
     )

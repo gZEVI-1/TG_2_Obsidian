@@ -1,8 +1,13 @@
 # TG_2_Obsidian
 
-Telegram-бот с AI-агентом для Obsidian через Obsidian Local REST API.
+Telegram-бот с AI-агентом для Obsidian: через Obsidian Local REST API или
+напрямую с файлами хранилища.
 Создаёт заметки, дополняет и правит существующие, автоматически располагает
 их внутри хранилища, ставит связи и обрабатывает ошибки API/сервера.
+
+Obsidian может быть закрыт: задайте `OBSIDIAN_VAULT_PATH` — бот будет читать
+и писать `.md`-файлы напрямую. Без этой переменной используется Local REST API
+(нужен запущенный Obsidian). Подробности — [docs/06_vault_mode.md](docs/06_vault_mode.md).
 
 Документация: [docs/README.md](docs/README.md).
 Функциональные требования: [docs/FEATURES.md](docs/FEATURES.md).
