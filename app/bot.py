@@ -43,6 +43,7 @@ from app.notes import (
     create_section,
     find_section,
     folder_from_text,
+    remove_text,
     replace_section,
     sections,
     split_folder_title,
@@ -140,7 +141,8 @@ HELP_TEXT = (
     "Обычными словами можно и больше:\n"
     "• «создай в заметке … раздел …» — новый раздел;\n"
     "• «создай папку …», «переименуй папку … в …», «удали папку …»;\n"
-    "• «перемести заметку … в …», «скопируй заметку … в …», «удали заметку …».\n"
+    "• «перемести заметку … в …», «скопируй заметку … в …», «удали заметку …»;\n"
+    "• «удали из заметки … строку/ссылку/абзац» — удаление фрагмента текста.\n"
     "Опасные действия бот показывает превью и выполняет только после "
     "подтверждения.\n\n"
     "Связи появляются в разделе «Связи»: при создании заметки бот предлагает "
@@ -643,6 +645,23 @@ async def _offer(
             sent.message_id,
         )
         return
+
+    if proposal.kind == "text_remove":
+        try:
+            current = await obsidian.read_note(proposal.path)
+            remove_text(current, proposal.content)
+        except ValueError as error:
+            memory.drop_action(chat_id)
+            await message.answer(
+                f"Не нашёл этот текст в заметке: {error}. "
+                "Проверьте точную формулировку — возможно, ссылка или строка "
+                "называется иначе."
+            )
+            return
+        except (ObsidianError, aiohttp.ClientError) as error:
+            memory.drop_action(chat_id)
+            await message.answer(_obsidian_error_text(error))
+            return
 
     links: tuple[str, ...] = ()
     if settings.agent_auto_link and proposal.kind in (
@@ -1651,6 +1670,19 @@ async def _apply(
             "Включите OBSIDIAN_DRY_RUN=false для реальной записи."
         )
 
+    if proposal.kind == "text_remove":
+        try:
+            current = await obsidian.read_note(path)
+            updated, removed = remove_text(current, proposal.content)
+            written = await obsidian.write_note(path, updated, overwrite=True)
+        except ValueError as error:
+            return f"Не удалось удалить текст: {error}."
+        except (ObsidianError, aiohttp.ClientError) as error:
+            return _obsidian_error_text(error)
+        if written:
+            return f"Удалено из «{path}»: вхождений — {removed}."
+        return f"Dry-run: текст из «{path}» не удалён."
+
     if proposal.kind == "links":
         try:
             current = await obsidian.read_note(path)
@@ -1701,6 +1733,7 @@ def _needs_confirm(settings: Settings, kind: str) -> bool:
         "append",
         "section",
         "section_create",
+        "text_remove",
         "folder_create",
         "folder_rename",
         "folder_delete",
@@ -1752,6 +1785,11 @@ def _proposal_text(proposal: Proposal, links: tuple[str, ...] = ()) -> str:
             f"Скопировать заметку «{proposal.path}» → "
             f"«{proposal.destination}»?"
         )
+    if proposal.kind == "text_remove":
+        return (
+            f"Удалить из «{proposal.path}»:\n\n"
+            f"{_preview(proposal.content)}\n\nПодтвердить?"
+        )
     if proposal.kind == "create":
         folder = f"\n\nПапка: {proposal.folder}" if proposal.folder else ""
         return (
@@ -1779,6 +1817,7 @@ def _proposal_title(proposal: Proposal) -> str:
     """Короткое название действия для сообщений об ошибках и dry-run."""
     return {
         "section_create": "создание раздела",
+        "text_remove": "удаление текста",
         "folder_create": "создание папки",
         "folder_rename": "переименование папки",
         "folder_delete": "удаление папки",

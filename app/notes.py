@@ -230,6 +230,7 @@ def destination_path(source: str, destination: str) -> str:
 
 
 _LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+_CONJUNCTIONS = frozenset({"и", "или", "а", "но", "да", "с", "со"})
 
 
 def _join_blocks(existing: str, block: str) -> str:
@@ -265,6 +266,177 @@ def contains_text(note: str, fragment: str) -> bool:
 
     needle = normalize(fragment)
     return bool(needle) and needle in normalize(note)
+
+
+def remove_text(note: str, fragment: str) -> tuple[str, int]:
+    """Удаляет фрагмент из тела заметки: строку, ссылку или абзац.
+
+    Frontmatter не трогается. Строка удаляется целиком, если совпадает с
+    фрагментом (с учётом маркера списка); внутри строки фрагмент вырезается,
+    после чего чистятся лишние пробелы. Ссылку можно передать как `[[Имя]]`,
+    так и просто именем — ссылки на это имя тоже находятся.
+
+    Возвращает (новый текст, сколько вхождений удалено); если ничего не
+    найдено, поднимает `ValueError`.
+    """
+    needle = fragment.strip()
+    if not needle:
+        raise ValueError("пустой фрагмент")
+
+    head, body = _split_frontmatter(note)
+    target = _link_target(needle)
+    link_pattern, text_pattern = _removal_patterns(needle, target)
+
+    removed = 0
+    kept: list[str] = []
+    for line in body.splitlines(keepends=True):
+        content = _line_content(line)
+        is_heading = bool(_HEADING_RE.match(line.rstrip("\r\n")))
+        if is_heading and not needle.startswith("#"):
+            # Заголовки не чистим по словам: иначе раздел останется без названия.
+            kept.append(line)
+            continue
+        if _same_text(content, needle) or (target and _same_text(content, target)):
+            removed += 1
+            continue
+        if is_heading:
+            kept.append(line)
+            continue
+        updated, count = _remove_in_line(line, link_pattern, text_pattern)
+        if not count:
+            kept.append(line)
+            continue
+        removed += count
+        if _line_is_empty(updated):
+            continue
+        kept.append(updated)
+
+    if not removed and "\n" in needle:
+        # Абзац из нескольких строк ищем подстрокой целиком.
+        pattern = re.compile(re.escape(needle), re.IGNORECASE)
+        body, removed = pattern.subn("", body)
+        if not removed:
+            raise ValueError("такой текст в заметке не найден")
+        return head + _collapse_blank_lines(body), removed
+
+    if not removed:
+        raise ValueError("такой текст в заметке не найден")
+    return head + _collapse_blank_lines("".join(kept)), removed
+
+
+def _split_frontmatter(text: str) -> tuple[str, str]:
+    """Отделяет YAML-frontmatter в начале заметки: его удалять нельзя."""
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        return "", text
+    for index in range(1, len(lines)):
+        if lines[index].strip() == "---":
+            return "".join(lines[: index + 1]), "".join(lines[index + 1 :])
+    return "", text
+
+
+def _link_target(fragment: str) -> str:
+    """Имя внутри ссылки: `[[Путь/Имя|альяс#якорь]]` → `Имя` или путь."""
+    raw = fragment.strip()
+    if raw.startswith("[[") and raw.endswith("]]"):
+        raw = raw[2:-2]
+    return raw.split("|", 1)[0].split("#", 1)[0].strip().strip("/")
+
+
+def _removal_patterns(
+    needle: str, target: str
+) -> tuple[re.Pattern[str] | None, re.Pattern[str]]:
+    """Шаблон ссылок на имя и шаблон самого текста.
+
+    Ссылки на другое имя (`[[Александр Шевчук]]` при удалении «Шевчук») не
+    считаются совпадением: иначе в заметке осталась бы битая ссылка.
+    """
+    link_pattern = None
+    if target:
+        link_pattern = re.compile(
+            rf"\[\[(?:[^\]|]*/)?{re.escape(target)}(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]",
+            re.IGNORECASE,
+        )
+    return link_pattern, re.compile(re.escape(needle), re.IGNORECASE)
+
+
+def _line_content(line: str) -> str:
+    """Строка без маркера списка и крайних пробелов."""
+    return re.sub(r"^\s*(?:[-*+]|\d+[.)])\s+", "", line).strip()
+
+
+def _same_text(left: str, right: str) -> bool:
+    """Сравнение текста без ссылочных скобок, регистра и лишних пробелов."""
+    def normalize(value: str) -> str:
+        value = value.casefold().replace("ё", "е")
+        value = re.sub(r"[\[\]|#]", " ", value)
+        return re.sub(r"\s+", " ", value).strip()
+
+    return bool(normalize(right)) and normalize(left) == normalize(right)
+
+
+def _remove_in_line(
+    line: str,
+    link_pattern: re.Pattern[str] | None,
+    text_pattern: re.Pattern[str],
+) -> tuple[str, int]:
+    """Вырезает ссылки на имя и сам текст вне ссылок; прибирает пробелы."""
+    updated = line
+    count = 0
+    if link_pattern is not None:
+        updated, found = link_pattern.subn("", updated)
+        count += found
+    updated, found = _sub_outside_links(text_pattern, updated)
+    count += found
+    if not count:
+        return line, 0
+    return _tidy_line(updated), count
+
+
+_LINK_SPAN_RE = re.compile(r"\[\[[^\[\]]*\]\]")
+
+
+def _sub_outside_links(
+    pattern: re.Pattern[str], text: str
+) -> tuple[str, int]:
+    """Заменяет только вне `[[...]]`: содержимое чужих ссылок не трогаем."""
+    parts: list[str] = []
+    count = 0
+    last = 0
+    for match in _LINK_SPAN_RE.finditer(text):
+        chunk, found = pattern.subn("", text[last : match.start()])
+        parts.append(chunk)
+        parts.append(match.group(0))
+        count += found
+        last = match.end()
+    chunk, found = pattern.subn("", text[last:])
+    parts.append(chunk)
+    count += found
+    return "".join(parts), count
+
+
+def _tidy_line(line: str) -> str:
+    """Убирает лишние пробелы и опустевшие скобки, сохраняя перевод строки."""
+    body = line.rstrip("\r\n")
+    ending = line[len(body) :]
+    body = re.sub(r"[ \t]{2,}", " ", body)
+    body = re.sub(r"[ \t]+([,.;:!?])", r"\1", body)
+    body = re.sub(r"\(\s*\)|\[\s*\]", "", body)
+    return body.rstrip() + ending
+
+
+def _line_is_empty(line: str) -> bool:
+    """Строка осталась пустой: маркер списка, знаки и союзы без слов."""
+    content = _line_content(line).strip(" -–—•*·,.;:!?()[]")
+    words = [word for word in re.split(r"[\s,;:]+", content) if word]
+    if not words:
+        return True
+    return all(word.casefold() in _CONJUNCTIONS for word in words)
+
+
+def _collapse_blank_lines(text: str) -> str:
+    """Три и больше переводов строки — это лишние пустые строки после удаления."""
+    return re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", text)
 
 
 def _sections(text: str, heading: str) -> list[Section]:

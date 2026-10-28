@@ -82,7 +82,9 @@ WRITE_RULES = (
     "search_notes; не выдумывай пути.\n"
     "7. Новый раздел или папку создавай только если их ещё нет; для папок "
     "сначала посмотри list_folders.\n"
-    "8. Отвечай коротко и по делу."
+    "8. Удаление текста — только через remove_text: передай точный фрагмент из "
+    "заметки. Не вызывай append_note или edit_section с пустым текстом.\n"
+    "9. Отвечай коротко и по делу."
 )
 
 STYLE_RULES = (
@@ -540,6 +542,25 @@ class Agent:
             log.info("Предложение удалить заметку: %s", path)
             return AgentResult(
                 text="", proposal=Proposal(kind="note_delete", path=path)
+            )
+
+        if call.name == "remove_text":
+            path = _argument(call.arguments, "path")
+            fragment = _argument(call.arguments, "text", strip=False)
+            try:
+                path = validate_path(path)
+            except ValueError as error:
+                return AgentResult(text=f"Некорректный путь заметки: {error}.")
+            if not fragment.strip():
+                return AgentResult(text="Модель не указала, что удалить.")
+            log.info(
+                "Предложение удалить текст из %s (%d симв.)", path, len(fragment)
+            )
+            return AgentResult(
+                text="",
+                proposal=Proposal(
+                    kind="text_remove", path=path, content=fragment
+                ),
             )
 
         path = _argument(call.arguments, "path")
