@@ -1,9 +1,10 @@
 """Клиенты хранилища Obsidian: Local REST API и прямой доступ к файлам.
 
-Режим выбирается настройкой `OBSIDIAN_VAULT_PATH`:
-- пусто — Local REST API (нужен запущенный Obsidian с плагином);
-- задан путь к папке vault — чтение и запись .md-файлов напрямую,
-  Obsidian при этом может быть закрыт.
+Режим выбирается настройкой `OBSIDIAN_MODE`:
+- `rest` — только Local REST API (нужен запущенный Obsidian с плагином);
+- `vault` — только чтение и запись .md-файлов напрямую, Obsidian может быть закрыт;
+- `auto` — сначала REST API, при недоступности — файлы vault (если задан
+  `OBSIDIAN_VAULT_PATH`).
 """
 
 from __future__ import annotations
@@ -21,9 +22,14 @@ from urllib.parse import quote
 
 import aiohttp
 
-from app.config import DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_DELAY, Settings
+from app.config import (
+    DEFAULT_FAILOVER_SECONDS,
+    DEFAULT_RETRY_ATTEMPTS,
+    DEFAULT_RETRY_DELAY,
+    Settings,
+)
 from app.notes import validate_folder, validate_path
-from app.retry import retryable_read
+from app.retry import is_transient, retryable_read
 from app.search import content_score, excerpt, query_terms, rank
 
 log = logging.getLogger(__name__)
@@ -891,13 +897,144 @@ class VaultClient(ObsidianBackend):
         return written
 
 
+class FailoverClient(ObsidianBackend):
+    """REST API первым, файлы vault — резерв при недоступности REST.
+
+    Переключение происходит только на временных сбоях (сеть, таймаут, 429, 5xx).
+    Ответы самого хранилища (404, 409 и т. п.) не повторяются на другом бэкенде:
+    иначе бот создал бы заметку в обход проверки на дубль.
+    """
+
+    def __init__(
+        self,
+        rest: ObsidianBackend,
+        vault: ObsidianBackend,
+        cooldown: float = DEFAULT_FAILOVER_SECONDS,
+    ) -> None:
+        self._rest = rest
+        self._vault = vault
+        self._cooldown = max(1.0, cooldown)
+        self._rest_down_until = 0.0
+
+    async def __aenter__(self) -> "FailoverClient":
+        await self._rest.__aenter__()
+        return self
+
+    async def close(self) -> None:
+        await self._rest.close()
+        await self._vault.close()
+
+    def _rest_skipped(self) -> bool:
+        """REST отключён до истечения паузы; после неё пробуем снова."""
+        if self._rest_down_until == 0.0:
+            return False
+        if time.monotonic() < self._rest_down_until:
+            return True
+        log.info("Obsidian: пауза истекла, снова проверяем REST API")
+        self._rest_down_until = 0.0
+        return False
+
+    def _mark_rest_down(self, error: BaseException) -> None:
+        self._rest_down_until = time.monotonic() + self._cooldown
+        log.warning(
+            "Obsidian: REST API недоступен (%s), %.0f с работаем с файлами vault",
+            error,
+            self._cooldown,
+        )
+
+    async def _dispatch(self, name: str, *args: Any, **kwargs: Any) -> Any:
+        if not self._rest_skipped():
+            try:
+                return await getattr(self._rest, name)(*args, **kwargs)
+            except Exception as error:  # noqa: BLE001 — решает is_transient
+                if not is_transient(error):
+                    raise
+                self._mark_rest_down(error)
+        return await getattr(self._vault, name)(*args, **kwargs)
+
+    async def backends_status(self) -> dict[str, str]:
+        """Состояние обоих бэкендов для `--check-obsidian`."""
+        report: dict[str, str] = {}
+        for label, backend in (("rest", self._rest), ("vault", self._vault)):
+            try:
+                status = await backend.health()
+                report[label] = "доступен" + (
+                    "" if status.get("authenticated", True) else " (ключ не принят)"
+                )
+            except Exception as error:  # noqa: BLE001 — это отчёт, а не работа
+                report[label] = f"недоступен: {error}"
+        return report
+
+    async def health(self) -> dict[str, Any]:
+        return await self._dispatch("health")
+
+    async def search(self, query: str, limit: int) -> list[dict[str, Any]]:
+        return await self._dispatch("search", query, limit)
+
+    async def list_notes(self) -> list[str]:
+        return await self._dispatch("list_notes")
+
+    async def list_folders(self) -> list[str]:
+        return await self._dispatch("list_folders")
+
+    async def create_folder(self, folder: str) -> bool:
+        return await self._dispatch("create_folder", folder)
+
+    async def rename_folder(self, folder: str, new_path: str) -> bool:
+        return await self._dispatch("rename_folder", folder, new_path)
+
+    async def delete_folder(self, folder: str) -> bool:
+        return await self._dispatch("delete_folder", folder)
+
+    async def delete_note(self, path: str) -> bool:
+        return await self._dispatch("delete_note", path)
+
+    async def copy_note(self, source: str, destination: str) -> bool:
+        return await self._dispatch("copy_note", source, destination)
+
+    async def move_note(self, source: str, destination: str) -> bool:
+        return await self._dispatch("move_note", source, destination)
+
+    async def folder_exists(self, folder: str) -> bool:
+        return await self._dispatch("folder_exists", folder)
+
+    async def note_exists(self, path: str) -> bool:
+        return await self._dispatch("note_exists", path)
+
+    async def read_note(self, path: str) -> str:
+        return await self._dispatch("read_note", path)
+
+    async def write_note(self, path: str, content: str, *, overwrite: bool = False) -> bool:
+        return await self._dispatch("write_note", path, content, overwrite=overwrite)
+
+
 def create_obsidian_client(settings: Settings) -> ObsidianBackend:
-    """Выбирает клиент по OBSIDIAN_MODE (в auto — по наличию пути к vault)."""
-    if settings.effective_obsidian_mode == "vault":
+    """Выбирает клиент: REST первым, в auto — с переходом на файлы vault."""
+    if settings.obsidian_mode == "vault":
         log.info(
             "Obsidian: режим vault, прямой доступ к файлам %s "
             "(REST API не используется)",
             settings.obsidian_vault_path,
         )
         return VaultClient(settings)
+
+    if settings.obsidian_fallback_enabled:
+        log.info(
+            "Obsidian: режим auto — REST API %s, резерв — файлы %s",
+            settings.obsidian_base_url,
+            settings.obsidian_vault_path,
+        )
+        return FailoverClient(
+            ObsidianClient(settings),
+            VaultClient(settings),
+            settings.obsidian_failover_seconds,
+        )
+
+    if settings.obsidian_mode == "auto" and settings.obsidian_vault_path:
+        log.info(
+            "Obsidian: режим auto без ключа REST — работаем с файлами %s",
+            settings.obsidian_vault_path,
+        )
+        return VaultClient(settings)
+
     return ObsidianClient(settings)

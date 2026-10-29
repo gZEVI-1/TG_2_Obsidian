@@ -13,7 +13,8 @@ Local REST API — плагин внутри Obsidian, поэтому в реж�
 и пишет `.md`-файлы напрямую в папке vault, без HTTP и без плагина.
 
 - Режим выбирается переменной `OBSIDIAN_MODE`:
-  - `auto` (по умолчанию) — `vault`, если задан `OBSIDIAN_VAULT_PATH`, иначе `rest`;
+  - `auto` (по умолчанию) — сначала REST API, при его недоступности файлы,
+    если задан `OBSIDIAN_VAULT_PATH` (подробно — [12_auto_mode.md](12_auto_mode.md));
   - `rest` — `ObsidianClient` (Local REST API), Obsidian должен быть запущен;
   - `vault` — `VaultClient`, Obsidian может быть закрыт, `OBSIDIAN_API_KEY`
     не нужен; путь в `OBSIDIAN_VAULT_PATH` обязателен.
@@ -43,7 +44,7 @@ Local REST API — плагин внутри Obsidian, поэтому в реж�
 В `.env`:
 
 ```dotenv
-# rest — через Local REST API, vault — файлы напрямую, auto — по наличию пути
+# rest — только Local REST API, vault — только файлы, auto — REST с резервом
 OBSIDIAN_MODE=vault
 OBSIDIAN_VAULT_PATH=E:\FOLDER\TG-OBS\TG-OBS-vault-test
 # или для рабочего хранилища:
@@ -58,7 +59,8 @@ OBSIDIAN_MODE=rest
 
 `OBSIDIAN_BASE_URL` и `OBSIDIAN_API_KEY` можно оставить — в режиме `vault`
 они не используются. При `OBSIDIAN_MODE=rest` путь из `OBSIDIAN_VAULT_PATH`
-игнорируется (в лог пишется предупреждение).
+игнорируется (в лог пишется предупреждение). В `auto` нужны оба значения:
+ключ включает REST, путь — резерв.
 
 ## Проверка
 

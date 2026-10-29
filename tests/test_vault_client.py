@@ -7,10 +7,13 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import aiohttp
 
 from app.config import Settings, load_settings
 from app.obsidian import (
+    FailoverClient,
     ObsidianClient,
     ObsidianError,
     VaultClient,
@@ -19,7 +22,7 @@ from app.obsidian import (
 
 
 def make_settings(
-    vault: Path, *, dry_run: bool = False, mode: str = "auto"
+    vault: Path, *, dry_run: bool = False, mode: str = "auto", api_key: str = ""
 ) -> Settings:
     return Settings(
         telegram_bot_token="test-token",
@@ -34,7 +37,7 @@ def make_settings(
         llm_stub_quota=1,
         llm_stub_reset_seconds=60,
         obsidian_base_url="http://127.0.0.1:27123",
-        obsidian_api_key="",
+        obsidian_api_key=api_key,
         obsidian_dry_run=dry_run,
         agent_confirmation="auto",
         agent_default_folder="Inbox",
@@ -225,12 +228,19 @@ class ModeTests(unittest.TestCase):
         ):
             return load_settings()
 
-    def test_auto_uses_vault_when_path_is_set(self) -> None:
+    def test_auto_uses_vault_without_api_key(self) -> None:
         settings = self.load(OBSIDIAN_VAULT_PATH=r"E:\Vault")
         self.assertEqual(settings.effective_obsidian_mode, "vault")
 
     def test_auto_uses_rest_without_path(self) -> None:
         self.assertEqual(self.load().effective_obsidian_mode, "rest")
+
+    def test_auto_prefers_rest_with_key(self) -> None:
+        settings = self.load(
+            OBSIDIAN_VAULT_PATH=r"E:\Vault", OBSIDIAN_API_KEY="test-key"
+        )
+        self.assertEqual(settings.effective_obsidian_mode, "rest")
+        self.assertTrue(settings.obsidian_fallback_enabled)
 
     def test_rest_ignores_vault_path(self) -> None:
         settings = self.load(
@@ -262,6 +272,92 @@ class ModeTests(unittest.TestCase):
                 OBSIDIAN_VAULT_PATH=folder,
             )
             self.assertIsInstance(create_obsidian_client(settings), VaultClient)
+
+    def test_factory_builds_failover_in_auto(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            settings = self.load(
+                OBSIDIAN_MODE="auto",
+                OBSIDIAN_VAULT_PATH=folder,
+                OBSIDIAN_API_KEY="test-key",
+            )
+            self.assertIsInstance(create_obsidian_client(settings), FailoverClient)
+
+
+class FailoverClientTests(unittest.TestCase):
+    """REST первым, файлы vault — только при временном сбое REST."""
+
+    def make(
+        self, rest_error: Exception | None = None, *, cooldown: float = 30.0
+    ) -> tuple[FailoverClient, MagicMock, MagicMock]:
+        rest = MagicMock()
+        rest.read_note = (
+            AsyncMock(side_effect=rest_error)
+            if rest_error is not None
+            else AsyncMock(return_value="rest")
+        )
+        rest.write_note = (
+            AsyncMock(side_effect=rest_error)
+            if rest_error is not None
+            else AsyncMock(return_value=True)
+        )
+        rest.health = AsyncMock(return_value={"service": "rest", "authenticated": True})
+        rest.close = AsyncMock()
+
+        vault = MagicMock()
+        vault.read_note = AsyncMock(return_value="vault")
+        vault.write_note = AsyncMock(return_value=True)
+        vault.health = AsyncMock(return_value={"service": "vault", "authenticated": True})
+        vault.close = AsyncMock()
+
+        return FailoverClient(rest, vault, cooldown), rest, vault
+
+    def run_async(self, coro):
+        return asyncio.run(coro)
+
+    def test_rest_is_used_first(self) -> None:
+        client, _rest, vault = self.make()
+        self.assertEqual(self.run_async(client.read_note("Заметка.md")), "rest")
+        vault.read_note.assert_not_awaited()
+
+    def test_connection_error_switches_to_vault(self) -> None:
+        client, rest, vault = self.make(aiohttp.ClientError("нет соединения"))
+        self.assertEqual(self.run_async(client.read_note("Заметка.md")), "vault")
+        rest.read_note.assert_awaited_once()
+        self.assertEqual(vault.read_note.await_count, 1)
+
+    def test_rest_is_not_retried_during_cooldown(self) -> None:
+        client, rest, vault = self.make(aiohttp.ClientError("нет соединения"))
+        self.run_async(client.read_note("A.md"))
+        self.run_async(client.read_note("B.md"))
+        rest.read_note.assert_awaited_once()
+        self.assertEqual(vault.read_note.await_count, 2)
+
+    def test_rest_is_probed_again_after_cooldown(self) -> None:
+        client, rest, _vault = self.make(aiohttp.ClientError("нет соединения"), cooldown=5)
+        with patch("app.obsidian.time.monotonic", return_value=1000.0):
+            self.run_async(client.read_note("A.md"))
+        with patch("app.obsidian.time.monotonic", return_value=1006.0):
+            self.run_async(client.read_note("B.md"))
+        self.assertEqual(rest.read_note.await_count, 2)
+
+    def test_not_found_is_not_repeated_on_vault(self) -> None:
+        client, _rest, vault = self.make(ObsidianError("нет заметки", 404))
+        with self.assertRaises(ObsidianError):
+            self.run_async(client.read_note("Нет.md"))
+        vault.read_note.assert_not_awaited()
+
+    def test_write_keeps_overwrite_flag(self) -> None:
+        client, _rest, vault = self.make(aiohttp.ClientError("нет соединения"))
+        self.assertTrue(
+            self.run_async(client.write_note("A.md", "текст", overwrite=True))
+        )
+        vault.write_note.assert_awaited_once_with("A.md", "текст", overwrite=True)
+
+    def test_status_reports_both_backends(self) -> None:
+        client, _rest, _vault = self.make(aiohttp.ClientError("нет соединения"))
+        states = self.run_async(client.backends_status())
+        self.assertIn("доступен", states["rest"])
+        self.assertIn("доступен", states["vault"])
 
 
 if __name__ == "__main__":

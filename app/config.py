@@ -33,6 +33,8 @@ DEFAULT_RAG_TOP_K = 5
 DEFAULT_RETRY_ATTEMPTS = 3
 MAX_RETRY_ATTEMPTS = 5
 DEFAULT_RETRY_DELAY = 0.5
+# Сколько секунд не трогать REST API после сбоя, прежде чем снова его проверить.
+DEFAULT_FAILOVER_SECONDS = 30.0
 
 # Порядок = качество: первая модель лучшая, последняя — запасная.
 # Список используется только в режиме заглушек, пока нет реальных API.
@@ -95,6 +97,7 @@ class Settings:
     obsidian_retry_attempts: int = DEFAULT_RETRY_ATTEMPTS
     obsidian_retry_delay: float = DEFAULT_RETRY_DELAY
     audit_enabled: bool = True
+    obsidian_failover_seconds: float = DEFAULT_FAILOVER_SECONDS
 
     @property
     def state_dir(self) -> "Path":
@@ -108,10 +111,21 @@ class Settings:
 
     @property
     def effective_obsidian_mode(self) -> str:
-        """Что реально используется: vault, rest или путь решает в auto."""
-        if self.obsidian_mode == "auto":
-            return "vault" if self.obsidian_vault_path else "rest"
-        return self.obsidian_mode
+        """Основной режим: в auto — REST API, файлы vault только как резерв."""
+        if self.obsidian_mode != "auto":
+            return self.obsidian_mode
+        if self.obsidian_api_key:
+            return "rest"
+        return "vault" if self.obsidian_vault_path else "rest"
+
+    @property
+    def obsidian_fallback_enabled(self) -> bool:
+        """В auto доступны оба бэкенда: REST первым, файлы — при сбое."""
+        return (
+            self.obsidian_mode == "auto"
+            and bool(self.obsidian_api_key)
+            and bool(self.obsidian_vault_path)
+        )
 
     def safe_summary(self) -> dict[str, str]:
         """Безопасное представление настроек для логов: без значений секретов."""
@@ -132,16 +146,16 @@ class Settings:
                 else "<не используется>"
             ),
             "obsidian_mode": (
-                (
-                    "vault (файлы напрямую)"
-                    if self.effective_obsidian_mode == "vault"
-                    else "rest (Local REST API)"
-                )
-                + (
-                    f", OBSIDIAN_MODE={self.obsidian_mode}"
-                    if self.obsidian_mode != "auto"
-                    else " (авто)"
-                )
+                "rest (Local REST API)"
+                if self.effective_obsidian_mode == "rest"
+                else "vault (файлы напрямую)"
+            )
+            + (
+                ", OBSIDIAN_MODE=" + self.obsidian_mode
+                if self.obsidian_mode != "auto"
+                else " + резерв vault"
+                if self.obsidian_fallback_enabled
+                else " (авто)"
             ),
             "obsidian_vault_path": self.obsidian_vault_path or "<не задан>",
             "obsidian_base_url": self.obsidian_base_url,
@@ -344,6 +358,12 @@ def load_settings() -> Settings:
             "OBSIDIAN_MODE=rest: OBSIDIAN_VAULT_PATH (%s) игнорируется",
             obsidian_vault_path,
         )
+    if obsidian_mode == "auto" and obsidian_vault_path and not _env_str("OBSIDIAN_API_KEY"):
+        log.warning(
+            "OBSIDIAN_MODE=auto: OBSIDIAN_API_KEY не задан, REST API недоступен — "
+            "работаем с файлами %s",
+            obsidian_vault_path,
+        )
 
     legacy_llm_url = _env_str("LLM_BASE_URL")
     legacy_llm_key = _env_str("LLM_API_KEY")
@@ -437,4 +457,10 @@ def load_settings() -> Settings:
             maximum=10.0,
         ),
         audit_enabled=_env_bool("AUDIT_ENABLED", default=True),
+        obsidian_failover_seconds=_env_float(
+            "OBSIDIAN_FAILOVER_SECONDS",
+            default=DEFAULT_FAILOVER_SECONDS,
+            minimum=1.0,
+            maximum=600.0,
+        ),
     )

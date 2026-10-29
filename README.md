@@ -42,8 +42,9 @@
 - **rest** — через плагин Obsidian Local REST API. Obsidian должен быть
   запущен, зато доступны его поиск, алиасы и теги.
 
-Режим выбирается одной переменной. По умолчанию (`auto`) включается `vault`,
-если задан путь к хранилищу, иначе `rest`.
+Режим выбирается одной переменной. По умолчанию (`auto`) бот сначала работает
+через REST API, а при его недоступности сам переходит на файлы, если задан путь
+к хранилищу; когда API снова отвечает, бот возвращается к нему.
 
 ## Возможности
 
@@ -167,8 +168,8 @@ OBSIDIAN_DRY_RUN=true
 | `LLM_API_<N>_KEY` | — | ключ аккаунта `N` (нумерация с 1) |
 | `LLM_API_<N>_NAME` | `account-N` | имя аккаунта для `/llm` |
 | `LLM_COOLDOWN_SECONDS` | `3600` | пауза пары при `429` без `Retry-After` |
-| `OBSIDIAN_MODE` | `auto` | `auto` / `vault` / `rest` |
-| `OBSIDIAN_VAULT_PATH` | — | путь к папке хранилища (для `vault` и `auto`) |
+| `OBSIDIAN_MODE` | `auto` | `auto` — REST, затем файлы; `vault` / `rest` — принудительно |
+| `OBSIDIAN_VAULT_PATH` | — | путь к папке хранилища (для `vault` и резерва в `auto`) |
 | `OBSIDIAN_BASE_URL` | `http://127.0.0.1:27123` | адрес Local REST API |
 | `OBSIDIAN_API_KEY` | — | ключ плагина Local REST API |
 | `OBSIDIAN_DRY_RUN` | `true` | `true` — только читать и показывать план, без записи |
