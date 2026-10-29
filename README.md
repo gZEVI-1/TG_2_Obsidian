@@ -11,7 +11,6 @@
   <a href="https://aiogram.dev/"><img alt="aiogram 3.x" src="https://img.shields.io/badge/aiogram-3.x-2CA5E0?style=flat-square&logo=telegram&logoColor=white"></a>
   <a href="https://obsidian.md/"><img alt="Obsidian" src="https://img.shields.io/badge/Obsidian-Markdown-7C3AED?style=flat-square&logo=obsidian&logoColor=white"></a>
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-yellow?style=flat-square"></a>
-  <a href="tests"><img alt="155 tests" src="https://img.shields.io/badge/tests-155%20passed-success?style=flat-square"></a>
 </p>
 
 <p align="center">
