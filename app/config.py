@@ -97,6 +97,16 @@ class Settings:
     audit_enabled: bool = True
 
     @property
+    def state_dir(self) -> "Path":
+        """Служебные файлы бота (журнал аудита): не заметки хранилища."""
+        return PROJECT_ROOT / "state"
+
+    @property
+    def audit_root(self) -> "Path":
+        """Папка журнала изменений — не хранилище заметок."""
+        return self.state_dir / "audit"
+
+    @property
     def effective_obsidian_mode(self) -> str:
         """Что реально используется: vault, rest или путь решает в auto."""
         if self.obsidian_mode == "auto":

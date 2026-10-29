@@ -138,6 +138,70 @@ class AuditedBackendTests(unittest.TestCase):
         self.assertEqual(self.entries(), [])
 
 
+class AuditGuardTests(unittest.TestCase):
+    """Агент не читает журнал: правило в промпте и запрет в read_note."""
+
+    def make_agent(self, vault: str = "") -> tuple[object, Settings]:
+        from app.agent import Agent
+
+        settings = Settings(
+            telegram_bot_token="t",
+            llm_base_url="",
+            llm_api_key="",
+            llm_model="",
+            llm_accounts=(),
+            llm_models=(),
+            llm_cooldown_seconds=60,
+            llm_stub=True,
+            llm_stub_accounts=1,
+            llm_stub_quota=1,
+            llm_stub_reset_seconds=60,
+            obsidian_base_url="http://127.0.0.1:27123",
+            obsidian_api_key="",
+            obsidian_dry_run=True,
+            agent_confirmation="auto",
+            agent_default_folder="Inbox",
+            agent_auto_folder=True,
+            agent_search_limit=5,
+            log_level="INFO",
+            obsidian_vault_path=vault,
+        )
+        return Agent(None, FakeBackend(), settings), settings  # type: ignore[arg-type]
+
+    def test_audit_rule_is_in_system_prompt(self) -> None:
+        from app.agent import WRITE_RULES
+
+        self.assertIn("9. Журнал изменений", WRITE_RULES)
+        self.assertIn("AuditLog", WRITE_RULES)
+        self.assertIn("AuditedBackend", WRITE_RULES)
+        self.assertIn("/audit", WRITE_RULES)
+        agent, _ = self.make_agent()
+        self.assertIn("Журнал изменений", agent.system_prompt)  # type: ignore[union-attr]
+
+    def test_audit_root_is_mapped_when_inside_vault(self) -> None:
+        from app.config import PROJECT_ROOT
+        from app.agent import _audit_root
+
+        agent, settings = self.make_agent(str(PROJECT_ROOT))
+        self.assertTrue(agent._is_audit_path("state/audit/2026-10-30.jsonl"))  # type: ignore[union-attr]
+        self.assertTrue(agent._is_audit_path("state/audit"))  # type: ignore[union-attr]
+        self.assertFalse(agent._is_audit_path("Notes/state/audit.md"))  # type: ignore[union-attr]
+        self.assertEqual(_audit_root(settings), "state/audit")
+
+    def test_read_note_refuses_audit_log(self) -> None:
+        from app.config import PROJECT_ROOT
+
+        agent, _ = self.make_agent(str(PROJECT_ROOT))
+        result = asyncio.run(  # type: ignore[union-attr]
+            agent._read("state/audit/2026-10-30.jsonl")
+        )
+        self.assertIn("служебный журнал", result)
+
+    def test_audit_path_outside_vault_is_ignored(self) -> None:
+        agent, _ = self.make_agent("E:\\some\\vault")
+        self.assertFalse(agent._is_audit_path("state/audit/x.jsonl"))  # type: ignore[union-attr]
+
+
 class ReliabilitySettingsTests(unittest.TestCase):
     def load(self, **env: str) -> Settings:
         with patch.dict("os.environ", env, clear=True), patch(

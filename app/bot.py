@@ -2201,7 +2201,7 @@ async def _refresh_rag(semantic: Any, obsidian: ObsidianBackend) -> None:
 async def run_bot(settings: Settings) -> None:
     """Запускает бота и блокируется до остановки (Ctrl+C)."""
     pool = LLMPool(settings)
-    audit = AuditLog(PROJECT_ROOT / "state" / "audit", settings.audit_enabled)
+    audit = AuditLog(settings.audit_root, settings.audit_enabled)
     obsidian = AuditedBackend(create_obsidian_client(settings), audit)
     semantic = _create_semantic(settings)
     agent = Agent(

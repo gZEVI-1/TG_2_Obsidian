@@ -6,6 +6,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from app.actions import prompt_block, tools as build_tools, write_actions
@@ -84,7 +85,12 @@ WRITE_RULES = (
     "сначала посмотри list_folders.\n"
     "8. Удаление текста — только через remove_text: передай точный фрагмент из "
     "заметки. Не вызывай append_note или edit_section с пустым текстом.\n"
-    "9. Отвечай коротко и по делу."
+    "9. Журнал изменений (`state/audit`, сущности AuditLog и AuditedBackend) — "
+    "служебный: не читай и не открывай его через read_note или другие команды. "
+    "Состояние журнала показывает команда /audit, и только по прямой просьбе "
+    "пользователя; после начала нового диалога (/new, /start) журнал упоминать "
+    "и трогать не нужно.\n"
+    "10. Отвечай коротко и по делу."
 )
 
 STYLE_RULES = (
@@ -206,6 +212,7 @@ class Agent:
         self._link_limit = settings.agent_link_limit
         self._rag_limit = settings.rag_top_k
         self._semantic = semantic
+        self._audit_root = _audit_root(settings)
         self._style = style.strip()[:4000]
         self.system_prompt = build_system_prompt(self._style)
 
@@ -607,6 +614,16 @@ class Agent:
             ),
         )
 
+    def _is_audit_path(self, path: str) -> bool:
+        """Путь ведёт в служебный журнал изменений: читать его агенту нельзя."""
+        if not self._audit_root:
+            return False
+        normalized = path.strip().replace("\\", "/").strip("/").casefold()
+        root = self._audit_root.replace("\\", "/").strip("/").casefold()
+        if not root:
+            return False
+        return normalized == root or normalized.startswith(f"{root}/")
+
     async def _run_tool(self, call: ToolCall) -> str:
         if call.name == "search_notes":
             return await self._search(_argument(call.arguments, "query"))
@@ -728,6 +745,12 @@ class Agent:
     async def _read(self, path: str) -> str:
         if not path:
             return "Ошибка: не указан путь."
+        if self._is_audit_path(path):
+            log.warning("Отклонено чтение служебного журнала: %s", path)
+            return (
+                "Это служебный журнал изменений, а не заметка: читать его через "
+                "read_note нельзя. Состояние журнала показывает команда /audit."
+            )
         log.info("Инструмент read_note: %s", path)
         try:
             content = await self._obsidian.read_note(path)
@@ -748,6 +771,21 @@ def _split_note(content: str) -> tuple[str, str]:
     if not first:
         return "Без названия", content
     return first[:80], f"# {first}\n\n{content}"
+
+
+def _audit_root(settings: Any) -> str:
+    """Папка журнала относительно корня хранилища (если она внутри него)."""
+    raw = getattr(settings, "audit_root", None)
+    if not raw:
+        return ""
+    state_dir = getattr(settings, "state_dir", None)
+    vault = getattr(settings, "obsidian_vault_path", "") or ""
+    if not state_dir or not vault:
+        return ""
+    try:
+        return Path(raw).resolve().relative_to(Path(vault).resolve()).as_posix()
+    except (OSError, ValueError):
+        return ""
 
 
 def _title_from_text(text: str) -> str:
