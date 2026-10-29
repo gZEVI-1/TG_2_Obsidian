@@ -10,6 +10,8 @@
   <a href="https://www.python.org/"><img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white"></a>
   <a href="https://aiogram.dev/"><img alt="aiogram 3.x" src="https://img.shields.io/badge/aiogram-3.x-2CA5E0?style=flat-square&logo=telegram&logoColor=white"></a>
   <a href="https://obsidian.md/"><img alt="Obsidian" src="https://img.shields.io/badge/Obsidian-Markdown-7C3AED?style=flat-square&logo=obsidian&logoColor=white"></a>
+  <a href="Dockerfile"><img alt="Docker" src="https://img.shields.io/badge/Docker-ready-2496ED?style=flat-square&logo=docker&logoColor=white"></a>
+  <a href="https://github.com/gZEVI-1/TG_2_Obsidian/actions/workflows/tests.yml"><img alt="tests" src="https://github.com/gZEVI-1/TG_2_Obsidian/actions/workflows/tests.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-yellow?style=flat-square"></a>
 </p>
 
@@ -175,6 +177,10 @@ OBSIDIAN_DRY_RUN=true
 | `OBSIDIAN_API_KEY` | — | ключ плагина Local REST API |
 | `OBSIDIAN_DRY_RUN` | `true` | `true` — только читать и показывать план, без записи |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL` |
+| `LOG_FILE` | `state/logs/app.log` | файл лога (ротация 2 МБ × 5); пусто — только консоль |
+| `BACKUP_DIR` | — | папка для копий; пусто — `--backup` и автокопии выключены |
+| `BACKUP_KEEP` | `7` | сколько последних копий хранить |
+| `BACKUP_EVERY_HOURS` | `24` | копия при старте, если просрочена, и проверка раз в час; `0` — только вручную |
 
 > В `.env.example` стоит `LLM_STUB=true`, чтобы бот запускался без ключей. Для
 > реальной работы поставьте `LLM_STUB=false` и заполните `LLM_API_1_*` — иначе
@@ -273,11 +279,14 @@ OBSIDIAN_DRY_RUN=true
 ```text
 TG_2_Obsidian/
 ├── app/
-│   ├── __main__.py     точка входа и проверки --check-*
+│   ├── __main__.py     точка входа и проверки --check-*, --health, --backup
 │   ├── bot.py          aiogram: команды, кнопки, сценарии, подтверждения
 │   ├── agent.py        цикл tool-calling, предложения изменений, промпты
 │   ├── actions.py      реестр инструментов агента (единый источник схем)
+│   ├── access.py       доступ по списку Telegram id
+│   ├── backup.py       zip-копии хранилища и журнала, расписание
 │   ├── config.py       чтение и валидация .env
+│   ├── health.py       проверка готовности без записи в хранилище
 │   ├── llm.py          OpenAI-совместимый клиент и пул аккаунтов/моделей
 │   ├── obsidian.py     ObsidianBackend: REST API и файловый режим
 │   ├── notes.py        разбор Markdown: разделы, пути, frontmatter
@@ -286,11 +295,30 @@ TG_2_Obsidian/
 │   ├── rag.py          локальные эмбеддинги, индекс, семантический поиск
 │   └── search.py       полнотекстовый поиск и ранжирование
 ├── docs/               проектная документация и журнал решений
-├── tests/              237 тестов на unittest
+├── tests/              246 тестов на unittest
+├── .github/workflows/  CI: тесты и сборка образа
+├── Dockerfile          образ для NAS/VPS
+├── docker-compose.yml  запуск с томами и автоперезапуском
 ├── .env.example        шаблон настроек с комментариями
 ├── requirements.txt    базовые зависимости
 └── requirements-rag.txt  опциональные зависимости RAG
 ```
+
+## Запуск в Docker (NAS, VPS, без Python на хосте)
+
+```bash
+git clone https://github.com/gZEVI-1/TG_2_Obsidian.git
+cd TG_2_Obsidian
+cp .env.example .env     # токен, ключи; OBSIDIAN_MODE=vault для NAS
+docker compose up -d --build
+docker compose logs -f bot
+```
+
+Пути на хосте задаются в `.env` (прямые слэши): `VAULT_PATH=/volume1/obsidian/MyVault`,
+`BACKUP_PATH=/volume1/docker/tg-obs/backups`. Внутри контейнера бот работает
+не от root, с часовым поясом `TZ` (по умолчанию `Asia/Dubai`), а
+`restart: unless-stopped` поднимает его после перезагрузки NAS или VPS.
+Подробности, обновление и RAG-сборка — [docs/16_ci_docker.md](docs/16_ci_docker.md).
 
 ## Документация
 
@@ -309,12 +337,14 @@ TG_2_Obsidian/
 | [docs/12_auto_mode.md](docs/12_auto_mode.md) | автопереключение REST API и файлов |
 | [docs/13_health_backup.md](docs/13_health_backup.md) | health-check, лог в файл, резервные копии, доступ |
 | [docs/14_access.md](docs/14_access.md) | список разрешённых пользователей и отказ чужим |
+| [docs/15_auto_backup.md](docs/15_auto_backup.md) | автоматические резервные копии по расписанию |
+| [docs/16_ci_docker.md](docs/16_ci_docker.md) | CI, Docker и развёртывание на NAS/VPS |
 | [docs/DECISIONS.md](docs/DECISIONS.md) | журнал архитектурных решений (ADR) |
 
 ## Разработка и тесты
 
 ```powershell
-# тесты: 237 штук, без сети
+# тесты: 246 штук, без сети
 $env:PYTHONIOENCODING='utf-8'
 python -m unittest discover -s tests -v
 
@@ -351,9 +381,11 @@ vault. Ниже — статус этапов.
 | 11 | Health-check, лог в файл, резервные копии, доступ | готово |
 | 12 | Перенос на NAS: автозапуск, HTTPS/туннель | отложено (ADR-44) |
 | 13 | Доступ по списку Telegram-пользователей | готово |
+| 14 | Автоматические резервные копии по расписанию | готово |
+| 15 | CI и Docker для NAS/VPS | готово |
 
-Идеи, которые пока не реализованы: Docker-образ, метрики и оповещения при
-сбоях, CI для тестов, расписание резервных копий. Если что-то из этого
+Идеи, которые пока не реализованы: метрики и оповещения при
+сбоях. Если что-то из этого
 нужно — issue приветствуется.
 
 ## FAQ

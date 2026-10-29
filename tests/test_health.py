@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+from app.backup import create_backup
 from app.config import Settings
 from app.health import (
     FAIL,
@@ -54,6 +57,7 @@ class HealthCheckTests(unittest.TestCase):
         self._temp = tempfile.TemporaryDirectory()
         self.project = Path(self._temp.name) / "project"
         self.vault = Path(self._temp.name) / "vault"
+        self.backups = Path(self._temp.name) / "backups"
         self.vault.mkdir()
         (self.vault / "Заметка.md").write_text("# Заметка\n", encoding="utf-8")
         self.patch_root = patch("app.config.PROJECT_ROOT", self.project)
@@ -88,6 +92,32 @@ class HealthCheckTests(unittest.TestCase):
 
     def test_backup_dir_not_set_warns(self) -> None:
         self.assertEqual(_check_backup(make_settings(self.vault))[1], WARN)
+
+    def test_backup_check_reports_fresh_copy(self) -> None:
+        settings = replace(make_settings(self.vault), backup_dir=str(self.backups))
+        create_backup(settings)
+        _name, status, detail = _check_backup(settings)
+        self.assertEqual(status, OK)
+        self.assertIn("каждые 24 ч", detail)
+
+    def test_backup_check_warns_when_stale(self) -> None:
+        settings = replace(make_settings(self.vault), backup_dir=str(self.backups))
+        archive = create_backup(settings)
+        old = (datetime.now() - timedelta(hours=30)).timestamp()
+        os.utime(archive, (old, old))
+        _name, status, detail = _check_backup(settings)
+        self.assertEqual(status, WARN)
+        self.assertIn("просрочена", detail)
+
+    def test_backup_check_manual_mode(self) -> None:
+        settings = replace(
+            make_settings(self.vault),
+            backup_dir=str(self.backups),
+            backup_every_hours=0,
+        )
+        _name, status, detail = _check_backup(settings)
+        self.assertEqual(status, OK)
+        self.assertIn("вручную", detail)
 
     def test_health_ok_for_available_vault(self) -> None:
         with patch(

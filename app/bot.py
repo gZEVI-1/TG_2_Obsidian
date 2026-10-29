@@ -27,6 +27,7 @@ from aiogram.types import (
 from app.access import AllowedUsersMiddleware
 from app.agent import Agent, Proposal
 from app.audit import AuditLog, AuditedBackend
+from app.backup import backup_if_due
 from app.config import PROJECT_ROOT, Settings
 from app.links import (
     DEFAULT_LINK_HEADING,
@@ -74,6 +75,8 @@ MAX_TEMPLATE_CHOICES = 6
 MAX_BUTTON_CHARS = 40
 BULK_LINK_NOTES = 300
 BULK_LINK_EXAMPLES = 5
+# Как часто проверять, не пора ли сделать копию (сам интервал — в настройках).
+BACKUP_CHECK_SECONDS = 3600
 
 BTN_NEW = "🆕 Новый диалог"
 BTN_HELP = "📖 Справка"
@@ -2231,6 +2234,25 @@ def register_access(dispatcher: Dispatcher, allowed: tuple[int, ...]) -> None:
     dispatcher.callback_query.outer_middleware(middleware)
 
 
+async def _auto_backup(settings: Settings) -> None:
+    """Копия при старте (если просрочена) и далее проверка раз в час.
+
+    Работает, только пока бот запущен: службы и планировщика нет. Копирование
+    идёт в отдельном потоке, чтобы чтение и запись файлов не тормозили
+    обработку сообщений.
+    """
+    if settings.backup_path is None or settings.backup_every_hours <= 0:
+        return
+    while True:
+        try:
+            archive = await asyncio.to_thread(backup_if_due, settings)
+            if archive is not None:
+                log.info("Автоматическая копия готова: %s", archive.name)
+        except (ValueError, OSError) as error:
+            log.warning("Автоматическая копия не сделана: %s", error)
+        await asyncio.sleep(BACKUP_CHECK_SECONDS)
+
+
 async def run_bot(settings: Settings) -> None:
     """Запускает бота и блокируется до остановки (Ctrl+C)."""
     pool = LLMPool(settings)
@@ -2251,6 +2273,7 @@ async def run_bot(settings: Settings) -> None:
         else None
     )
     memory = ChatMemory()
+    backup_task = asyncio.create_task(_auto_backup(settings))
     bot = Bot(token=settings.telegram_bot_token)
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
@@ -2286,6 +2309,9 @@ async def run_bot(settings: Settings) -> None:
             audit=audit,
         )
     finally:
+        backup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await backup_task
         if rag_task is not None:
             rag_task.cancel()
             with suppress(asyncio.CancelledError):

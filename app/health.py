@@ -15,6 +15,7 @@ import aiohttp
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 
+from app.backup import backup_due, last_backup
 from app.config import Settings, is_local_url
 from app.obsidian import FailoverClient, ObsidianError, create_obsidian_client
 
@@ -148,7 +149,21 @@ def _check_backup(settings: Settings) -> tuple[str, str, str]:
         return ("копии", FAIL, f"нет доступа к {target}: {error}")
     if not os.access(target, os.W_OK):
         return ("копии", FAIL, f"нет записи в {target}")
-    return ("копии", OK, f"{target}, хранить {settings.backup_keep}")
+
+    if settings.backup_every_hours <= 0:
+        return ("копии", OK, f"{target}, только вручную (BACKUP_EVERY_HOURS=0)")
+    last = last_backup(settings)
+    if last is None:
+        return (
+            "копии",
+            WARN,
+            f"{target}: копий ещё нет, бот сделает при старте",
+        )
+    interval = f"каждые {settings.backup_every_hours:g} ч"
+    moment = f"последняя {last:%d.%m %H:%M}"
+    if backup_due(settings):
+        return ("копии", WARN, f"{target}: {moment}, просрочена ({interval})")
+    return ("копии", OK, f"{target}: {moment} ({interval})")
 
 
 def _check_access(settings: Settings) -> tuple[str, str, str]:

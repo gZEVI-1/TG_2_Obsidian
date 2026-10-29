@@ -42,6 +42,8 @@ DEFAULT_FAILOVER_SECONDS = 30.0
 # Лог в файл: относительный путь считается от корня проекта, пусто — только консоль.
 DEFAULT_LOG_FILE = "state/logs/app.log"
 DEFAULT_BACKUP_KEEP = 7
+# Как часто делать копию, пока бот запущен; 0 — только вручную командой --backup.
+DEFAULT_BACKUP_EVERY_HOURS = 24.0
 
 # Порядок = качество: первая модель лучшая, последняя — запасная.
 # Список используется только в режиме заглушек, пока нет реальных API.
@@ -109,6 +111,7 @@ class Settings:
     log_file: str = DEFAULT_LOG_FILE
     backup_dir: str = ""
     backup_keep: int = DEFAULT_BACKUP_KEEP
+    backup_every_hours: float = DEFAULT_BACKUP_EVERY_HOURS
 
     @property
     def log_path(self) -> "Path | None":
@@ -210,6 +213,11 @@ class Settings:
             "log_file": str(self.log_path) if self.log_path else "<только консоль>",
             "backup_dir": str(self.backup_path) if self.backup_path else "<не задан>",
             "backup_keep": str(self.backup_keep),
+            "backup_every_hours": (
+                f"каждые {self.backup_every_hours:g} ч"
+                if self.backup_every_hours > 0
+                else "<только вручную>"
+            ),
             "log_level": self.log_level,
         }
 
@@ -550,5 +558,11 @@ def load_settings() -> Settings:
             default=DEFAULT_BACKUP_KEEP,
             minimum=1,
             maximum=100,
+        ),
+        backup_every_hours=_env_float(
+            "BACKUP_EVERY_HOURS",
+            default=DEFAULT_BACKUP_EVERY_HOURS,
+            minimum=0.0,
+            maximum=720.0,
         ),
     )

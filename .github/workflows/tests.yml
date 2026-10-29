@@ -1,0 +1,61 @@
+# CI: тесты на каждый push и pull request, плюс проверка сборки образа.
+# Секреты не нужны: тесты работают без сети и без настоящего .env.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Установка зависимостей
+        run: pip install -r requirements.txt
+
+      # RAG-тесты сами пропускаются без numpy: полный набор с torch в CI
+      # не нужен, он проверяется локально через requirements-rag.txt.
+      - name: Тесты
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python -m unittest discover -s tests -v
+
+  docker:
+    name: docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Проверка docker-compose.yml
+        run: |
+          cp .env.example .env
+          docker compose config --quiet
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Сборка образа
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

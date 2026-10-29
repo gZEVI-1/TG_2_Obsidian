@@ -1,0 +1,46 @@
+# Запуск бота в Docker: NAS, VPS или локально без Python на хосте.
+#
+#   cp .env.example .env         # заполнить токен, ключи и VAULT_PATH
+#   docker compose up -d --build
+#   docker compose logs -f bot
+#
+# Переменные VAULT_PATH, BACKUP_PATH, STATE_PATH (пути на хосте) можно задать
+# в .env или в файле рядом. Пути — в прямых слэшах: E:/FOLDER/... или /volume1/...
+# Внутри контейнера .env тоже читается, но OBSIDIAN_VAULT_PATH и BACKUP_DIR
+# переопределены ниже на /vault и /backups — на смонтированные каталоги.
+
+services:
+  bot:
+    build:
+      context: .
+      args:
+        # 1 — собрать с RAG (sentence-transformers, ~1 ГБ), 0 — без него.
+        INSTALL_RAG: "${INSTALL_RAG:-0}"
+    image: tg-obs:local
+    container_name: tg-obs
+    # Автозапуск при загрузке NAS/VPS и перезапуск после сбоя.
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    environment:
+      TZ: "${TZ:-Asia/Dubai}"
+      OBSIDIAN_VAULT_PATH: /vault
+      BACKUP_DIR: /backups
+      # Если Obsidian запущен на хосте и Local REST API слушает сеть,
+      # раскомментируйте: контейнер увидит его по этому адресу.
+      # OBSIDIAN_BASE_URL: "http://host.docker.internal:27123"
+    volumes:
+      - "${VAULT_PATH:-./vault}:/vault"
+      - "${BACKUP_PATH:-./backups}:/backups"
+      - "${STATE_PATH:-./state}:/app/state"
+    # UID/GID владельца файлов на хосте: на Synology обычно 1026, на VPS — 1000.
+    user: "${PUID:-1000}:${PGID:-1000}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
