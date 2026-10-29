@@ -296,6 +296,17 @@ def _env_str(name: str, default: str = "") -> str:
     return value.strip()
 
 
+def is_local_url(url: str) -> bool:
+    """Адрес ведёт на этот компьютер: localhost, 127.0.0.0/8 или ::1."""
+    host = (urlsplit(url).hostname or "").lower()
+    if host == "localhost":
+        return True
+    try:
+        return ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def _env_user_ids(name: str) -> tuple[int, ...]:
     """Числовые Telegram id через запятую или пробел; пусто — список не задан."""
     raw = _env_str(name)

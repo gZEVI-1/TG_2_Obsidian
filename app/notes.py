@@ -134,15 +134,27 @@ def find_section(text: str, heading: str) -> Section | None:
 
 
 def replace_section(text: str, heading: str, body: str) -> str:
-    """Заменяет тело раздела, сохраняя frontmatter и остальные разделы."""
+    """Заменяет тело раздела, сохраняя frontmatter и остальные разделы.
+
+    Пустое тело очищает раздел: заголовок остаётся, тело исчезает.
+    """
     section = find_section(text, heading)
     if section is None:
         raise ValueError(f"раздел «{heading}» не найден")
 
     lines = text.splitlines(keepends=True)
     has_next = section.end < len(lines)
-    block = "\n" + body.strip("\n") + ("\n\n" if has_next else "\n")
+    clean = body.strip("\n")
+    if clean:
+        block = "\n" + clean + ("\n\n" if has_next else "\n")
+    else:
+        block = "\n" if has_next else ""
     return "".join(lines[: section.start] + [block] + lines[section.end :])
+
+
+def clear_section(text: str, heading: str) -> str:
+    """Убирает тело раздела, оставляя заголовок и остальную заметку."""
+    return replace_section(text, heading, "")
 
 
 def append_to_section(text: str, heading: str, body: str) -> str:

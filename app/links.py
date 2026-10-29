@@ -15,6 +15,33 @@ HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*$")
 DEFAULT_LINK_HEADING = "Связи"
 MIN_MENTION_LENGTH = 4
 
+# Просьба убрать связи: механическая операция, модель для неё не нужна.
+REMOVE_LINKS_RE = re.compile(
+    r"\b(убери|уберите|убрать|удали|удалите|удалить|очисти|очистите|очистить|"
+    r"сотри|сотрите|стереть|remove|delete|clear)\b.{0,40}?"
+    r"\b(связ\w*|ссылк\w*|links?)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def wants_remove_links(text: str) -> bool:
+    """Пользователь просит убрать связи из раздела."""
+    return bool(REMOVE_LINKS_RE.search(text))
+
+
+def remove_links(text: str) -> str:
+    """Убирает `[[ссылки]]`: строки из одних ссылок исчезают, текст остаётся."""
+    kept: list[str] = []
+    for line in text.splitlines():
+        if not LINK_RE.search(line):
+            kept.append(line)
+            continue
+        rest = LINK_RE.sub("", line)
+        rest = re.sub(r"\s{2,}", " ", rest).strip(" \t-–—,;:")
+        if rest:
+            kept.append(rest)
+    return "\n".join(kept)
+
 
 def note_title(path: str) -> str:
     """Имя заметки без папки и расширения."""

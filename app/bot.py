@@ -24,6 +24,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
+from app.access import AllowedUsersMiddleware
 from app.agent import Agent, Proposal
 from app.audit import AuditLog, AuditedBackend
 from app.config import PROJECT_ROOT, Settings
@@ -2223,6 +2224,13 @@ async def _refresh_rag(semantic: Any, obsidian: ObsidianBackend) -> None:
         log.warning("RAG: индекс не обновлён: %s", error)
 
 
+def register_access(dispatcher: Dispatcher, allowed: tuple[int, ...]) -> None:
+    """Ставит ограничение доступа на сообщения и нажатия кнопок."""
+    middleware = AllowedUsersMiddleware(frozenset(allowed))
+    dispatcher.message.outer_middleware(middleware)
+    dispatcher.callback_query.outer_middleware(middleware)
+
+
 async def run_bot(settings: Settings) -> None:
     """Запускает бота и блокируется до остановки (Ctrl+C)."""
     pool = LLMPool(settings)
@@ -2246,6 +2254,16 @@ async def run_bot(settings: Settings) -> None:
     bot = Bot(token=settings.telegram_bot_token)
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
+
+    allowed = frozenset(settings.telegram_allowed_users)
+    register_access(dispatcher, settings.telegram_allowed_users)
+    if allowed:
+        log.info("Доступ: разрешённых пользователей — %d", len(allowed))
+    else:
+        log.warning(
+            "TELEGRAM_ALLOWED_USERS не задан: бот отвечает любому чату. "
+            "Узнайте свой id и впишите его в .env."
+        )
 
     try:
         me = await bot.get_me()

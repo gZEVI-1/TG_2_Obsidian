@@ -37,6 +37,59 @@ MAX_SUGGESTED_FOLDERS = 3
 MAX_LINK_CANDIDATES = 20
 LINK_FALLBACK_CHOICES = 3
 
+# Модель иногда возвращает не текст, а свои рассуждения: теги, цитаты
+# инструкции или английские размышления вместо русского текста.
+_THINKING_RE = re.compile(
+    r"<(think|thinking|thought|reasoning|analysis)>.*?</\1>",
+    re.IGNORECASE | re.DOTALL,
+)
+_FENCE_RE = re.compile(r"^```[a-zA-Z]*[ \t]*\n(.*?)\n```[ \t]*$", re.DOTALL)
+_REASONING_PHRASES = (
+    "return only",
+    "the output should be",
+    "let's check the instruction",
+    "let me check",
+    "user's wish",
+    "instructions say",
+    "i should return",
+    "i will output",
+    "since the user wants",
+    "верни только",
+    "пожелание пользователя:",
+)
+
+
+def _letters(text: str) -> tuple[int, int]:
+    """Сколько в тексте кириллицы и латиницы (буквы, без цифр и знаков)."""
+    cyrillic = sum(1 for char in text if "\u0400" <= char <= "\u04ff")
+    latin = sum(1 for char in text if char.isascii() and char.isalpha())
+    return cyrillic, latin
+
+
+def _looks_like_reasoning(text: str, source: str) -> bool:
+    """Похоже ли на рассуждение модели вместо содержимого заметки.
+
+    Признаки: цитата инструкции («return only», «user's wish») или смена
+    языка — исходный текст русский, а ответ вдруг английский. Второй признак
+    ловит связный ход мыслей без служебных фраз.
+    """
+    lowered = text.casefold()
+    if any(phrase in lowered for phrase in _REASONING_PHRASES):
+        return True
+    source_cyrillic, _source_latin = _letters(source)
+    text_cyrillic, text_latin = _letters(text)
+    return source_cyrillic >= 20 and text_cyrillic < 10 and text_latin >= 60
+
+
+def _clean_completion(text: str) -> str:
+    """Убирает служебную обёртку: теги рассуждений и ```-блок вокруг ответа."""
+    cleaned = _THINKING_RE.sub("", text).strip()
+    fenced = _FENCE_RE.match(cleaned)
+    if fenced:
+        cleaned = fenced.group(1).strip()
+    return cleaned
+
+
 BASE_PROMPT = (
     "Ты живой и дружелюбный помощник в Telegram. Работаешь с хранилищем Obsidian "
     "пользователя и говоришь по-русски просто, по-человечески: без канцелярита, "

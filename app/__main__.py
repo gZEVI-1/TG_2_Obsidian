@@ -1,4 +1,4 @@
-"""Точка входа: python -m app [--check-config | --check-obsidian | --check-llm | --check-rag]."""
+"""Точка входа: python -m app [--check-* | --health | --backup]."""
 
 from __future__ import annotations
 
@@ -8,8 +8,10 @@ import logging
 
 import aiohttp
 
+from app.backup import create_backup
 from app.bot import run_bot
 from app.config import PROJECT_ROOT, Settings, load_settings
+from app.health import check_health
 from app.llm import LLMError, LLMPool
 from app.logging_setup import setup_logging
 from app.obsidian import FailoverClient, ObsidianError, create_obsidian_client
@@ -73,6 +75,16 @@ def parse_args() -> argparse.Namespace:
         "--check-rag",
         action="store_true",
         help="проверить RAG: модель эмбеддингов, индекс и семантический поиск",
+    )
+    group.add_argument(
+        "--health",
+        action="store_true",
+        help="быстрая проверка готовности: хранилище, LLM, RAG, копии, доступ",
+    )
+    group.add_argument(
+        "--backup",
+        action="store_true",
+        help="сделать резервную копию хранилища и журнала в BACKUP_DIR",
     )
     return parser.parse_args()
 
@@ -199,13 +211,29 @@ def main() -> None:
     # о недостающем .env тоже попало в лог. Уровень уточняем после.
     setup_logging("INFO")
     settings = load_settings()
-    logging.getLogger().setLevel(settings.log_level)
+    setup_logging(settings.log_level, settings.log_path)
     log_settings(settings)
 
     args = parse_args()
 
     if args.check_config:
         print("config OK")
+        return
+
+    if args.health:
+        healthy = asyncio.run(check_health(settings))
+        print("health OK" if healthy else "health FAILED")
+        if not healthy:
+            raise SystemExit(2)
+        return
+
+    if args.backup:
+        try:
+            archive = create_backup(settings)
+        except ValueError as error:
+            log.error("Резервная копия: %s", error)
+            raise SystemExit(2) from error
+        print(str(archive))
         return
 
     if args.check_obsidian:
