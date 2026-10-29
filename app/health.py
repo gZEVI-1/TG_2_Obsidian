@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import logging
 import os
+from urllib.parse import urlsplit
 
 import aiohttp
 from aiogram import Bot
@@ -167,15 +168,24 @@ def _check_backup(settings: Settings) -> tuple[str, str, str]:
 
 
 def _check_access(settings: Settings) -> tuple[str, str, str]:
-    """Local REST API должен слушать только этот компьютер."""
-    if not is_local_url(settings.obsidian_base_url):
+    """Local REST API должен слушать только этот компьютер; TLS — по желанию."""
+    url = settings.obsidian_base_url
+    if not is_local_url(url):
         return (
             "доступ",
             WARN,
-            f"{settings.obsidian_base_url} виден по сети без TLS: "
-            "нужен HTTPS или туннель",
+            f"{url} виден по сети без TLS: нужен HTTPS или SSH-туннель",
         )
-    return ("доступ", OK, f"{settings.obsidian_base_url} — только этот компьютер")
+    if urlsplit(url).scheme == "https":
+        if settings.obsidian_verify_ssl:
+            return ("доступ", OK, f"{url} — HTTPS с проверкой сертификата")
+        return (
+            "доступ",
+            WARN,
+            f"{url} — HTTPS без проверки сертификата "
+            "(OBSIDIAN_VERIFY_SSL=false)",
+        )
+    return ("доступ", OK, f"{url} — только этот компьютер")
 
 
 def _check_log(settings: Settings) -> tuple[str, str, str]:

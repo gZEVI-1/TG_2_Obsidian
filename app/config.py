@@ -96,6 +96,7 @@ class Settings:
     log_level: str
     obsidian_mode: str = "auto"
     obsidian_vault_path: str = ""
+    obsidian_verify_ssl: bool = True
     telegram_allowed_users: tuple[int, ...] = ()
     agent_template_folder: str = "Templates"
     agent_style_note: str = ""
@@ -196,6 +197,7 @@ class Settings:
             "obsidian_base_url": self.obsidian_base_url,
             "obsidian_api_key": _describe_secret(self.obsidian_api_key),
             "obsidian_dry_run": str(self.obsidian_dry_run).lower(),
+            "obsidian_verify_ssl": str(self.obsidian_verify_ssl).lower(),
             "agent_confirmation": self.agent_confirmation,
             "agent_default_folder": self.agent_default_folder,
             "agent_auto_folder": str(self.agent_auto_folder).lower(),
@@ -492,6 +494,14 @@ def load_settings() -> Settings:
             obsidian_base_url,
         )
 
+    obsidian_verify_ssl = _env_bool("OBSIDIAN_VERIFY_SSL", default=True)
+    if not obsidian_verify_ssl:
+        log.warning(
+            "OBSIDIAN_VERIFY_SSL=false: сертификат HTTPS не проверяется. "
+            "Это допустимо только для самоподписанного сертификата Obsidian "
+            "на своём устройстве."
+        )
+
     return Settings(
         telegram_bot_token=_env_str("TELEGRAM_BOT_TOKEN"),
         telegram_allowed_users=_env_user_ids("TELEGRAM_ALLOWED_USERS"),
@@ -520,6 +530,7 @@ def load_settings() -> Settings:
         log_level=log_level,
         obsidian_mode=obsidian_mode,
         obsidian_vault_path=obsidian_vault_path,
+        obsidian_verify_ssl=obsidian_verify_ssl,
         agent_template_folder=_env_folder("AGENT_TEMPLATE_FOLDER", "Templates"),
         agent_style_note=_env_note_path("AGENT_STYLE_NOTE"),
         agent_auto_link=_env_bool("AGENT_AUTO_LINK", default=True),

@@ -1,0 +1,34 @@
+[Unit]
+# Шаблон systemd-юнита для NAS/VPS без Docker.
+# Скопируйте в /etc/systemd/system/tg-obs.service, поправьте пути и user,
+# затем: sudo systemctl daemon-reload && sudo systemctl enable --now tg-obs
+Description=TG-OBS — Telegram bot with AI agent for Obsidian
+Documentation=https://github.com/gZEVI-1/TG_2_Obsidian
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tgobs
+Group=tgobs
+WorkingDirectory=/opt/tg-obs
+# Файл .env читается как переменные окружения (комментарии # допустимы).
+EnvironmentFile=/opt/tg-obs/.env
+ExecStart=/opt/tg-obs/.venv/bin/python -m app
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+# Логи уходят в journald: journalctl -u tg-obs -f
+StandardOutput=journal
+StandardError=journal
+
+# Минимальная изоляция. ReadWritePaths перечислите под свои каталоги:
+# state/, хранилище, каталог копий. Если путь не существует, юнит не стартует.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/tg-obs/state /srv/obsidian/vault /srv/obsidian/backups
+
+[Install]
+WantedBy=multi-user.target

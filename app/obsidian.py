@@ -191,6 +191,7 @@ class ObsidianClient(ObsidianBackend):
         self._base_url = settings.obsidian_base_url
         self._api_key = settings.obsidian_api_key
         self._dry_run = settings.obsidian_dry_run
+        self._verify_ssl = getattr(settings, "obsidian_verify_ssl", True)
         self._retry_attempts = getattr(
             settings, "obsidian_retry_attempts", DEFAULT_RETRY_ATTEMPTS
         )
@@ -205,9 +206,15 @@ class ObsidianClient(ObsidianBackend):
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
+            connector = None
+            if not self._verify_ssl:
+                # Самоподписанный сертификат Obsidian: проверку отключаем
+                # осознанно, по настройке OBSIDIAN_VERIFY_SSL=false.
+                connector = aiohttp.TCPConnector(ssl=False)
             self._session = aiohttp.ClientSession(
                 headers={"Authorization": f"Bearer {self._api_key}"},
                 timeout=aiohttp.ClientTimeout(total=TIMEOUT_SECONDS),
+                connector=connector,
             )
         return self._session
 

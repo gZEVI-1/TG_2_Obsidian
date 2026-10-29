@@ -282,6 +282,10 @@ class ModeTests(unittest.TestCase):
             )
             self.assertIsInstance(create_obsidian_client(settings), FailoverClient)
 
+    def test_verify_ssl_default_and_override(self) -> None:
+        self.assertTrue(self.load().obsidian_verify_ssl)
+        self.assertFalse(self.load(OBSIDIAN_VERIFY_SSL="false").obsidian_verify_ssl)
+
 
 class FailoverClientTests(unittest.TestCase):
     """REST первым, файлы vault — только при временном сбое REST."""

@@ -79,6 +79,25 @@ class HealthCheckTests(unittest.TestCase):
         self.assertEqual(status, WARN)
         self.assertIn("HTTPS", detail)
 
+    def test_https_local_is_ok(self) -> None:
+        settings = replace(
+            make_settings(self.vault),
+            obsidian_base_url="https://127.0.0.1:27124",
+        )
+        _name, status, detail = _check_access(settings)
+        self.assertEqual(status, OK)
+        self.assertIn("HTTPS", detail)
+
+    def test_https_without_verify_warns(self) -> None:
+        settings = replace(
+            make_settings(self.vault),
+            obsidian_base_url="https://127.0.0.1:27124",
+            obsidian_verify_ssl=False,
+        )
+        _name, status, detail = _check_access(settings)
+        self.assertEqual(status, WARN)
+        self.assertIn("без проверки", detail)
+
     def test_llm_checks(self) -> None:
         stub = make_settings(self.vault)
         self.assertEqual(_check_llm(stub)[1], WARN)
