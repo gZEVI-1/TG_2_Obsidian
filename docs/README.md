@@ -7,6 +7,13 @@ Telegram-бот с AI-агентом для Obsidian: через Local REST API 
 расположение внутри хранилища, простановка связей и обработка ошибок API.
 Подробные требования — в [FEATURES.md](FEATURES.md).
 
+## Начните здесь
+
+- [Установка и запуск для новичков](INSTALL.md) — Python, Obsidian, BotFather,
+  ключи LLM, `.env`, проверки, автозапуск и разбор ошибок.
+- [Свои промпты](PROMPTS.md) — стиль письма, шаблоны и системный промпт.
+- [Основной README](../README.md) — возможности, команды и настройки.
+
 ## Этапы
 
 | № | Этап | Документ | Статус |
@@ -60,8 +67,8 @@ Telegram-бот с AI-агентом для Obsidian: через Local REST API 
 LLM работает через пул аккаунтов и моделей: при лимите на аккаунте запрос
 уходит на следующий аккаунт той же модели, после всех аккаунтов — на
 следующую модель по качеству, а после исчерпания всех пар срабатывает
-автосброс к лучшей модели. Пока реальные ключи не добавлены, включён режим
-заглушек. Подробности и переменные — [LLM_POOL.md](LLM_POOL.md).
+автосброс к лучшей модели. Режим заглушек (`LLM_STUB=true`) оставлен для
+проверки настройки без ключей. Подробности и переменные — [LLM_POOL.md](LLM_POOL.md).
 
 Агент работает по FR-01…FR-04, FR-07…FR-09 ([FEATURES.md](FEATURES.md)):
 подтверждения по `AGENT_CONFIRMATION`, расположение по кнопкам
@@ -127,13 +134,15 @@ LLM работает через пул аккаунтов и моделей: п�
 
 ## Быстрый старт
 
-Все команды — из корня репозитория `TG_2_Obsidian`:
+Подробная установка для новичков — [INSTALL.md](INSTALL.md). Кратко, из корня
+репозитория `TG_2_Obsidian`:
 
 ```powershell
-cd E:\FOLDER\TG-OBS\TG_2_Obsidian
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
 # семантический поиск (опционально, тянет torch и модель ~470 МБ):
-# .\.venv\Scripts\python.exe -m pip install -r requirements-rag.txt
+# pip install -r requirements-rag.txt
 Copy-Item .env.example .env    # если .env ещё нет; заполнить значения
-.\.venv\Scripts\python.exe -m app
+python -m app
 ```
