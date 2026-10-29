@@ -478,7 +478,8 @@ job собирает Docker-образ. Локально RAG-тесты идут
 | [Оглавление документации](docs/README.md) | карта docs: с чего начать и что где искать |
 | [Функциональные требования](docs/FEATURES.md) | FR-01…FR-10 и критерии приёмки |
 | [Журнал решений](docs/DECISIONS.md) | ADR-01…ADR-49: почему сделано именно так |
-| [Docker и NAS](docs/16_ci_docker.md) | CI, Docker, systemd, HTTPS и SSH-туннель |
+| [Docker и NAS](docs/16_ci_docker.md) | CI, Docker, systemd, HTTPS, SSH-туннель и публикация в GHCR |
+| [About проекта](docs/ABOUT.md) | готовый текст для поля About на GitHub и topics |
 | [Пул LLM](docs/LLM_POOL.md) | аккаунты, модели, лимиты, автосброс |
 | [Файловый режим](docs/06_vault_mode.md) | работа без Obsidian и её ограничения |
 | [Связи](docs/08_links.md) | автолинковка и массовая простановка |

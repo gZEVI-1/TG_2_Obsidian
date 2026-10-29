@@ -178,6 +178,115 @@ journalctl -u tg-obs -f
 После переезда проверьте: `--health` (хранилище, доступ, копии), одну тестовую
 заметку, копию `--backup` в сетевую папку и перезагрузку NAS.
 
+## Публикация образа в GitHub Packages (GHCR)
+
+Смысл: собрать образ один раз в CI и на NAS делать только `docker pull`, без
+компиляции зависимостей на слабом устройстве.
+
+### Вариант A. Автоматически по тегу (рекомендуется)
+
+1. Добавьте в репозиторий `.github/workflows/publish.yml`:
+
+   ```yaml
+   name: publish
+   on:
+     push:
+       tags: ["v*"]
+     workflow_dispatch:
+
+   permissions:
+     contents: read
+     packages: write
+
+   jobs:
+     image:
+       runs-on: ubuntu-latest
+       steps:
+         - uses: actions/checkout@v4
+         - uses: docker/setup-buildx-action@v3
+         - uses: docker/login-action@v3
+           with:
+             registry: ghcr.io
+             username: ${{ github.actor }}
+             password: ${{ secrets.GITHUB_TOKEN }}
+         - uses: docker/metadata-action@v5
+           id: meta
+           with:
+             # ВАЖНО: имя образа в GHCR только строчными буквами.
+             # Замените gzevi-1 на свой логин GitHub, если форкаете проект.
+             images: ghcr.io/gzevi-1/tg-obs
+             tags: |
+               type=ref,event=tag
+               type=raw,value=latest
+         - uses: docker/build-push-action@v6
+           with:
+             context: .
+             push: true
+             tags: ${{ steps.meta.outputs.tags }}
+             labels: ${{ steps.meta.outputs.labels }}
+             cache-from: type=gha
+             cache-to: type=gha,mode=max
+   ```
+
+2. Проверьте права: **Settings → Actions → General → Workflow permissions** —
+   «Read and write» либо оставьте «Read», job-уровень `packages: write` этого
+   достаточно. Для организаций ограничение может задаваться на уровне org.
+3. Выпустите тег: `git tag v1.0.0 && git push origin v1.0.0`. Workflow
+   соберёт и запушит `ghcr.io/gzevi-1/tg-obs:v1.0.0` и `:latest`.
+4. Сделайте пакет публичным (если нужно тянуть без авторизации):
+   **профиль → Packages → tg-obs → Package settings → Change visibility →
+   Public**.
+
+### Вариант B. Вручную с домашней машины
+
+Нужен personal access token (classic) с правами `write:packages`,
+`read:packages`; для fine-grained — «Packages: read and write».
+
+```powershell
+$env:CR_PAT = "ghp_..."
+$env:CR_PAT | docker login ghcr.io -u gZEVI-1 --password-stdin
+
+docker build -t ghcr.io/gzevi-1/tg-obs:dev .
+docker tag ghcr.io/gzevi-1/tg-obs:dev ghcr.io/gzevi-1/tg-obs:latest
+docker push ghcr.io/gzevi-1/tg-obs:dev
+docker push ghcr.io/gzevi-1/tg-obs:latest
+
+Remove-Item Env:CR_PAT
+```
+
+С RAG: `docker build --build-arg INSTALL_RAG=1 -t ghcr.io/gzevi-1/tg-obs:rag .`
+и `docker push ghcr.io/gzevi-1/tg-obs:rag`.
+
+### Как использовать на NAS
+
+В `docker-compose.yml` замените сборку на готовый образ:
+
+```yaml
+services:
+  bot:
+    image: ghcr.io/gzevi-1/tg-obs:latest
+    # build: .        # больше не нужно
+    pull_policy: always
+    restart: unless-stopped
+    env_file: [.env]
+    # ... тома и environment как раньше
+```
+
+Обновление: `docker compose pull && docker compose up -d`. Если пакет
+приватный — один раз выполните на NAS `docker login ghcr.io` с токеном
+`read:packages`.
+
+### Частые ошибки
+
+| Симптом | Причина и решение |
+|---|---|
+| `denied: permission_denied` при pull | пакет приватный или нет `docker login ghcr.io` |
+| `403 Forbidden` при push | у токена нет `write:packages` или в workflow нет `packages: write` |
+| `invalid reference format` | в имени образа заглавные буквы — GHCR требует строчные |
+| `manifest unknown` | неверный тег; посмотрите список: `docker manifest inspect ghcr.io/gzevi-1/tg-obs:latest` |
+| `unauthorized` в Actions | job не получил `packages: write`; проверьте блок `permissions` |
+| Пакет не появился в профиле | он привязан к репозиторию: **профиль → Packages** или вкладка репозитория |
+
 ## Риски и откат
 
 - **Права на тома.** Если `PUID/PGID` не совпадает с владельцем папки
@@ -206,5 +315,5 @@ journalctl -u tg-obs -f
 ## Следующий шаг
 
 Обязательных работ не осталось: этапы 0–15 закрыты, этап 12 доступен как
-опциональная инфраструктура. По желанию: оповещения о сбоях в Telegram,
-метрики, публикация образа в GHCR и автообновление на NAS.
+опциональная инфраструктура. Публикация образа в GHCR описана выше. По
+желанию: оповещения о сбоях в Telegram, метрики, автообновление на NAS.
