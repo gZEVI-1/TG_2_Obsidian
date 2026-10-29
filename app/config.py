@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass
+from ipaddress import ip_address
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
@@ -35,6 +38,10 @@ MAX_RETRY_ATTEMPTS = 5
 DEFAULT_RETRY_DELAY = 0.5
 # Сколько секунд не трогать REST API после сбоя, прежде чем снова его проверить.
 DEFAULT_FAILOVER_SECONDS = 30.0
+
+# Лог в файл: относительный путь считается от корня проекта, пусто — только консоль.
+DEFAULT_LOG_FILE = "state/logs/app.log"
+DEFAULT_BACKUP_KEEP = 7
 
 # Порядок = качество: первая модель лучшая, последняя — запасная.
 # Список используется только в режиме заглушек, пока нет реальных API.
@@ -87,6 +94,7 @@ class Settings:
     log_level: str
     obsidian_mode: str = "auto"
     obsidian_vault_path: str = ""
+    telegram_allowed_users: tuple[int, ...] = ()
     agent_template_folder: str = "Templates"
     agent_style_note: str = ""
     agent_auto_link: bool = True
@@ -98,6 +106,25 @@ class Settings:
     obsidian_retry_delay: float = DEFAULT_RETRY_DELAY
     audit_enabled: bool = True
     obsidian_failover_seconds: float = DEFAULT_FAILOVER_SECONDS
+    log_file: str = DEFAULT_LOG_FILE
+    backup_dir: str = ""
+    backup_keep: int = DEFAULT_BACKUP_KEEP
+
+    @property
+    def log_path(self) -> "Path | None":
+        """Куда писать лог: пусто — только консоль."""
+        if not self.log_file.strip():
+            return None
+        path = Path(self.log_file).expanduser()
+        return path if path.is_absolute() else PROJECT_ROOT / path
+
+    @property
+    def backup_path(self) -> "Path | None":
+        """Папка резервных копий: пусто — команда backup не настроена."""
+        if not self.backup_dir.strip():
+            return None
+        path = Path(self.backup_dir).expanduser()
+        return path if path.is_absolute() else PROJECT_ROOT / path
 
     @property
     def state_dir(self) -> "Path":
@@ -131,6 +158,11 @@ class Settings:
         """Безопасное представление настроек для логов: без значений секретов."""
         return {
             "telegram_bot_token": _describe_secret(self.telegram_bot_token),
+            "telegram_allowed_users": (
+                f"разрешено: {len(self.telegram_allowed_users)}"
+                if self.telegram_allowed_users
+                else "<все: список не задан>"
+            ),
             "llm_mode": "заглушки" if self.llm_stub else "реальный API",
             "llm_models": ", ".join(self.llm_models) or "<не заданы>",
             "llm_accounts": _describe_accounts(self.llm_accounts),
@@ -175,6 +207,9 @@ class Settings:
             "obsidian_retry_attempts": str(self.obsidian_retry_attempts),
             "obsidian_retry_delay": f"{self.obsidian_retry_delay:.1f} с",
             "audit_enabled": str(self.audit_enabled).lower(),
+            "log_file": str(self.log_path) if self.log_path else "<только консоль>",
+            "backup_dir": str(self.backup_path) if self.backup_path else "<не задан>",
+            "backup_keep": str(self.backup_keep),
             "log_level": self.log_level,
         }
 
@@ -259,6 +294,28 @@ def _env_str(name: str, default: str = "") -> str:
     if value is None:
         return default
     return value.strip()
+
+
+def _env_user_ids(name: str) -> tuple[int, ...]:
+    """Числовые Telegram id через запятую или пробел; пусто — список не задан."""
+    raw = _env_str(name)
+    if not raw:
+        return ()
+    ids: list[int] = []
+    for part in re.split(r"[,\s]+", raw):
+        if not part:
+            continue
+        try:
+            value = int(part)
+        except ValueError:
+            raise ValueError(
+                f"{name}: ожидаются числовые id через запятую, получено {part!r}"
+            ) from None
+        if value <= 0:
+            raise ValueError(f"{name}: id должен быть положительным, получено {value}")
+        if value not in ids:
+            ids.append(value)
+    return tuple(ids)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -405,8 +462,20 @@ def load_settings() -> Settings:
                 "и LLM_API_1_KEY (или LLM_BASE_URL и LLM_API_KEY)"
             )
 
+    obsidian_base_url = _env_str(
+        "OBSIDIAN_BASE_URL", DEFAULT_OBSIDIAN_BASE_URL
+    ).rstrip("/")
+    if not is_local_url(obsidian_base_url):
+        log.warning(
+            "OBSIDIAN_BASE_URL (%s) — не локальный адрес: Local REST API без TLS "
+            "будет доступен по сети. Оставьте 127.0.0.1, включите HTTPS или "
+            "используйте SSH-туннель.",
+            obsidian_base_url,
+        )
+
     return Settings(
         telegram_bot_token=_env_str("TELEGRAM_BOT_TOKEN"),
+        telegram_allowed_users=_env_user_ids("TELEGRAM_ALLOWED_USERS"),
         llm_base_url=legacy_llm_url,
         llm_api_key=legacy_llm_key,
         llm_model=legacy_llm_model,
@@ -422,7 +491,7 @@ def load_settings() -> Settings:
         llm_stub_accounts=llm_stub_accounts,
         llm_stub_quota=llm_stub_quota,
         llm_stub_reset_seconds=llm_stub_reset_seconds,
-        obsidian_base_url=_env_str("OBSIDIAN_BASE_URL", DEFAULT_OBSIDIAN_BASE_URL).rstrip("/"),
+        obsidian_base_url=obsidian_base_url,
         obsidian_api_key=_env_str("OBSIDIAN_API_KEY"),
         obsidian_dry_run=_env_bool("OBSIDIAN_DRY_RUN", default=True),
         agent_confirmation=confirmation,
@@ -462,5 +531,13 @@ def load_settings() -> Settings:
             default=DEFAULT_FAILOVER_SECONDS,
             minimum=1.0,
             maximum=600.0,
+        ),
+        log_file=_env_str("LOG_FILE", DEFAULT_LOG_FILE),
+        backup_dir=_env_str("BACKUP_DIR"),
+        backup_keep=_env_int(
+            "BACKUP_KEEP",
+            default=DEFAULT_BACKUP_KEEP,
+            minimum=1,
+            maximum=100,
         ),
     )
