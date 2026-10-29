@@ -21,8 +21,9 @@ from urllib.parse import quote
 
 import aiohttp
 
-from app.config import Settings
+from app.config import DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_DELAY, Settings
 from app.notes import validate_folder, validate_path
+from app.retry import retryable_read
 from app.search import content_score, excerpt, query_terms, rank
 
 log = logging.getLogger(__name__)
@@ -184,6 +185,12 @@ class ObsidianClient(ObsidianBackend):
         self._base_url = settings.obsidian_base_url
         self._api_key = settings.obsidian_api_key
         self._dry_run = settings.obsidian_dry_run
+        self._retry_attempts = getattr(
+            settings, "obsidian_retry_attempts", DEFAULT_RETRY_ATTEMPTS
+        )
+        self._retry_delay = getattr(
+            settings, "obsidian_retry_delay", DEFAULT_RETRY_DELAY
+        )
         self._session: aiohttp.ClientSession | None = None
 
     async def __aenter__(self) -> ObsidianClient:
@@ -205,6 +212,7 @@ class ObsidianClient(ObsidianBackend):
     def _note_url(self, path: str) -> str:
         return f"{self._base_url}/vault/{quote(path, safe='/')}"
 
+    @retryable_read
     async def health(self) -> dict[str, Any]:
         """Проверяет, что API доступен и ключ принят."""
         session = await self._ensure_session()
@@ -213,6 +221,7 @@ class ObsidianClient(ObsidianBackend):
                 raise ObsidianError(f"GET /: HTTP {response.status}", response.status)
             return await response.json(content_type=None)
 
+    @retryable_read
     async def search(self, query: str, limit: int) -> list[dict[str, Any]]:
         """Полнотекстовый поиск по хранилищу (FR-09)."""
         needle = " ".join(query_terms(query))
@@ -230,6 +239,7 @@ class ObsidianClient(ObsidianBackend):
             data = await response.json(content_type=None)
         return list(data)[:limit]
 
+    @retryable_read
     async def list_notes(self) -> list[str]:
         """Все .md-файлы хранилища, рекурсивно; глубина и число ограничены."""
         notes: list[str] = []
@@ -261,6 +271,7 @@ class ObsidianClient(ObsidianBackend):
             if len(out) >= MAX_LISTED_NOTES:
                 return
 
+    @retryable_read
     async def list_folders(self) -> list[str]:
         """Все папки хранилища, рекурсивно, без служебных каталогов."""
         folders: list[str] = []
@@ -436,6 +447,7 @@ class ObsidianClient(ObsidianBackend):
             return False
         return await self._transfer("MOVE", source, destination)
 
+    @retryable_read
     async def folder_exists(self, folder: str) -> bool:
         """Проверяет, существует ли папка в хранилище."""
         folder = folder.strip().strip("/")
@@ -452,6 +464,7 @@ class ObsidianClient(ObsidianBackend):
                 f"GET /vault/{folder}: HTTP {response.status}", response.status
             )
 
+    @retryable_read
     async def note_exists(self, path: str) -> bool:
         session = await self._ensure_session()
         async with session.get(
@@ -465,6 +478,7 @@ class ObsidianClient(ObsidianBackend):
                 f"GET {path}: HTTP {response.status}", response.status
             )
 
+    @retryable_read
     async def read_note(self, path: str) -> str:
         session = await self._ensure_session()
         async with session.get(

@@ -16,6 +16,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BotCommand,
     CallbackQuery,
+    ErrorEvent,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -24,6 +25,7 @@ from aiogram.types import (
 )
 
 from app.agent import Agent, Proposal
+from app.audit import AuditLog, AuditedBackend
 from app.config import PROJECT_ROOT, Settings
 from app.links import (
     add_links,
@@ -110,6 +112,7 @@ COMMANDS = [
     BotCommand(command="links", description="Связи во всех заметках"),
     BotCommand(command="rag", description="Состояние семантического поиска"),
     BotCommand(command="reindex", description="Обновить RAG-индекс"),
+    BotCommand(command="audit", description="Журнал изменений"),
     BotCommand(command="llm", description="Состояние LLM-пула"),
     BotCommand(command="llm_reset", description="Сбросить лимиты LLM"),
 ]
@@ -149,9 +152,9 @@ HELP_TEXT = (
     "их кнопкой, а в существующей — по просьбе «свяжи заметку…».\n\n"
     "Поиск понимает смысл: «что я писал про сроки релиза» найдёт заметку, "
     "даже если таких слов в ней нет. /rag — состояние индекса, /reindex — "
-    "пересобрать после больших правок.\n\n"
-    "Команды: /start, /help, /new, /folders, /links, /rag, /reindex, /llm — "
-    "состояние моделей и лимитов."
+    "пересобрать после больших правок. /audit — последние изменения.\n\n"
+    "Команды: /start, /help, /new, /folders, /links, /rag, /reindex, /audit, "
+    "/llm — состояние моделей и лимитов."
 )
 
 
@@ -193,6 +196,7 @@ class ChatMemory:
         self._actions: dict[int, tuple[int, PendingAction]] = {}
         self._flows: dict[int, Flow] = {}
         self._pages: dict[int, str] = {}
+        self._operations: dict[int, str] = {}
 
     def get(self, chat_id: int) -> list[dict[str, str]]:
         """Копия истории: вызывающая сторона не может изменить хранилище."""
@@ -242,6 +246,19 @@ class ChatMemory:
         self._actions.pop(chat_id, None)
         self._flows.pop(chat_id, None)
         self._pages.pop(chat_id, None)
+
+    def begin_operation(self, chat_id: int, name: str) -> bool:
+        """Долгая операция одна на чат: повторный запуск не начнётся молча."""
+        if chat_id in self._operations:
+            return False
+        self._operations[chat_id] = name
+        return True
+
+    def end_operation(self, chat_id: int) -> None:
+        self._operations.pop(chat_id, None)
+
+    def current_operation(self, chat_id: int) -> str:
+        return self._operations.get(chat_id, "")
 
 
 def _keyboard_for(chat_id: int, memory: ChatMemory) -> ReplyKeyboardMarkup:
@@ -323,6 +340,13 @@ async def cmd_reindex(
     if semantic is None:
         await message.answer(_rag_status_text(None), reply_markup=keyboard)
         return
+    if not memory.begin_operation(message.chat.id, "индексация"):
+        await message.answer(
+            "Уже выполняется: "
+            f"{memory.current_operation(message.chat.id)}. Дождитесь окончания.",
+            reply_markup=keyboard,
+        )
+        return
 
     status = await message.answer(
         "Обновляю RAG-индекс: читаю заметки и считаю эмбеддинги…"
@@ -335,6 +359,8 @@ async def cmd_reindex(
             f"Не удалось обновить индекс: {error}", reply_markup=keyboard
         )
         return
+    finally:
+        memory.end_operation(message.chat.id)
 
     await status.edit_text(
         "RAG-индекс готов.\n"
@@ -362,6 +388,50 @@ def _rag_status_text(semantic: Any) -> str:
     else:
         lines.append("Индекс ещё не построен — выполните /reindex")
     return "\n".join(lines)
+
+
+@router.message(Command("audit"))
+async def cmd_audit(
+    message: Message, memory: ChatMemory, audit: AuditLog
+) -> None:
+    """Последние изменения хранилища из журнала."""
+    entries = await audit.tail(5)
+    await message.answer(
+        _audit_text(entries),
+        reply_markup=_keyboard_for(message.chat.id, memory),
+    )
+
+
+def _audit_text(entries: list[dict[str, Any]]) -> str:
+    """Короткая сводка последних записей журнала."""
+    if not entries:
+        return "Журнал пуст: изменений ещё не было."
+    lines = ["Последние изменения:"]
+    for entry in entries:
+        stamp = str(entry.get("ts", ""))[11:16]
+        action = entry.get("action", "?")
+        target = entry.get("path") or "—"
+        status = entry.get("status", "")
+        lines.append(f"• {stamp} — {action}: {target} ({status})")
+    lines.append("\nЖурнал лежит в `state/audit/`.")
+    return "\n".join(lines)
+
+
+@router.errors()
+async def on_error(event: ErrorEvent) -> bool:
+    """Последний рубеж: необработанная ошибка не должна убивать диалог."""
+    log.error("Необработанная ошибка: %s", event.exception, exc_info=event.exception)
+    message = getattr(event.update, "message", None)
+    if message is None:
+        return True
+    try:
+        await message.answer(
+            "Что-то пошло не так при обработке запроса. "
+            "Попробуйте ещё раз или начните новый диалог командой /new."
+        )
+    except TelegramAPIError as send_error:
+        log.warning("Не удалось сообщить об ошибке: %s", send_error)
+    return True
 
 
 # Кнопки клавиатуры дублируют команды точным совпадением текста: модель
@@ -770,12 +840,21 @@ async def _offer_bulk(
 ) -> None:
     """FR-06: план связей по всему хранилищу, подтверждение и отчёт."""
     chat_id = message.chat.id
+    if not memory.begin_operation(chat_id, "сбор плана связей"):
+        await message.answer(
+            "Уже выполняется: "
+            f"{memory.current_operation(chat_id)}. Дождитесь окончания."
+        )
+        return
+
     status = await message.answer("Сканирую хранилище и собираю план связей…")
     try:
         plan, errors, total, checked = await _bulk_plan(obsidian, settings)
     except (ObsidianError, aiohttp.ClientError) as error:
         await status.edit_text(_obsidian_error_text(error))
         return
+    finally:
+        memory.end_operation(chat_id)
 
     if not plan:
         memory.drop_action(chat_id)
@@ -793,7 +872,17 @@ async def _offer_bulk(
     text = _bulk_plan_text(plan, total, checked, errors)
     if settings.agent_confirmation == "never":
         memory.drop_action(chat_id)
-        await status.edit_text(f"{text}\n\n{await _apply_bulk(obsidian, plan)}")
+        if not memory.begin_operation(chat_id, "простановка связей"):
+            await status.edit_text(
+                "Уже выполняется: "
+                f"{memory.current_operation(chat_id)}. Дождитесь окончания."
+            )
+            return
+        try:
+            result = await _apply_bulk(obsidian, plan)
+        finally:
+            memory.end_operation(chat_id)
+        await status.edit_text(f"{text}\n\n{result}")
         return
 
     await status.edit_text(f"{text}\n\nПрименить?", reply_markup=_bulk_keyboard())
@@ -1450,8 +1539,19 @@ async def on_bulk_yes(
     action = await _pending(callback, memory)
     if action is None:
         return
-    memory.drop_action(callback.message.chat.id)
-    await callback.message.edit_text(await _apply_bulk(obsidian, action.plan))
+    chat_id = callback.message.chat.id
+    memory.drop_action(chat_id)
+    if not memory.begin_operation(chat_id, "простановка связей"):
+        await callback.message.edit_text(
+            "Уже выполняется: "
+            f"{memory.current_operation(chat_id)}. Дождитесь окончания."
+        )
+        return
+    try:
+        result = await _apply_bulk(obsidian, action.plan)
+    finally:
+        memory.end_operation(chat_id)
+    await callback.message.edit_text(result)
 
 
 async def _reply_folder(
@@ -2101,7 +2201,8 @@ async def _refresh_rag(semantic: Any, obsidian: ObsidianBackend) -> None:
 async def run_bot(settings: Settings) -> None:
     """Запускает бота и блокируется до остановки (Ctrl+C)."""
     pool = LLMPool(settings)
-    obsidian = create_obsidian_client(settings)
+    audit = AuditLog(PROJECT_ROOT / "state" / "audit", settings.audit_enabled)
+    obsidian = AuditedBackend(create_obsidian_client(settings), audit)
     semantic = _create_semantic(settings)
     agent = Agent(
         pool,
@@ -2139,6 +2240,7 @@ async def run_bot(settings: Settings) -> None:
             llm=pool,
             template_files=template_files,
             semantic=semantic,
+            audit=audit,
         )
     finally:
         if rag_task is not None:

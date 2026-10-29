@@ -30,6 +30,10 @@ MAX_LINK_LIMIT = 50
 DEFAULT_RAG_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 DEFAULT_RAG_TOP_K = 5
 
+DEFAULT_RETRY_ATTEMPTS = 3
+MAX_RETRY_ATTEMPTS = 5
+DEFAULT_RETRY_DELAY = 0.5
+
 # Порядок = качество: первая модель лучшая, последняя — запасная.
 # Список используется только в режиме заглушек, пока нет реальных API.
 DEFAULT_STUB_MODELS = (
@@ -88,6 +92,9 @@ class Settings:
     rag_enabled: bool = True
     rag_model: str = DEFAULT_RAG_MODEL
     rag_top_k: int = DEFAULT_RAG_TOP_K
+    obsidian_retry_attempts: int = DEFAULT_RETRY_ATTEMPTS
+    obsidian_retry_delay: float = DEFAULT_RETRY_DELAY
+    audit_enabled: bool = True
 
     @property
     def effective_obsidian_mode(self) -> str:
@@ -141,6 +148,9 @@ class Settings:
             "rag_enabled": str(self.rag_enabled).lower(),
             "rag_model": self.rag_model or "<не задана>",
             "rag_top_k": str(self.rag_top_k),
+            "obsidian_retry_attempts": str(self.obsidian_retry_attempts),
+            "obsidian_retry_delay": f"{self.obsidian_retry_delay:.1f} с",
+            "audit_enabled": str(self.audit_enabled).lower(),
             "log_level": self.log_level,
         }
 
@@ -247,6 +257,21 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
         value = int(raw)
     except ValueError:
         raise ValueError(f"{name}: ожидается целое число, получено {raw!r}") from None
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name}: ожидается от {minimum} до {maximum}, получено {value}")
+    return value
+
+
+def _env_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    raw = _env_str(name)
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(
+            f"{name}: ожидается число, получено {raw!r}"
+        ) from None
     if not minimum <= value <= maximum:
         raise ValueError(f"{name}: ожидается от {minimum} до {maximum}, получено {value}")
     return value
@@ -389,4 +414,17 @@ def load_settings() -> Settings:
         rag_enabled=_env_bool("RAG_ENABLED", default=True),
         rag_model=_env_str("RAG_MODEL", DEFAULT_RAG_MODEL),
         rag_top_k=_env_int("RAG_TOP_K", default=DEFAULT_RAG_TOP_K, minimum=1, maximum=20),
+        obsidian_retry_attempts=_env_int(
+            "OBSIDIAN_RETRY_ATTEMPTS",
+            default=DEFAULT_RETRY_ATTEMPTS,
+            minimum=1,
+            maximum=MAX_RETRY_ATTEMPTS,
+        ),
+        obsidian_retry_delay=_env_float(
+            "OBSIDIAN_RETRY_DELAY_SECONDS",
+            default=DEFAULT_RETRY_DELAY,
+            minimum=0.0,
+            maximum=10.0,
+        ),
+        audit_enabled=_env_bool("AUDIT_ENABLED", default=True),
     )

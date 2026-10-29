@@ -305,6 +305,9 @@
 | `RAG_ENABLED` | `true`, `false` | `true` | 8 |
 | `RAG_MODEL` | имя модели sentence-transformers | `paraphrase-multilingual-MiniLM-L12-v2` | 8 |
 | `RAG_TOP_K` | целое, 1–20 | `5` | 8 |
+| `OBSIDIAN_RETRY_ATTEMPTS` | целое, 1–5 | `3` | 9 |
+| `OBSIDIAN_RETRY_DELAY_SECONDS` | число, 0–10 | `0.5` | 9 |
+| `AUDIT_ENABLED` | `true`, `false` | `true` | 9 |
 
 Неверные значения валидируются при загрузке настроек: опечатка должна
 проявляться сразу, а не молча подставляться.
