@@ -142,7 +142,10 @@ COMPOSE_SECTION_PROMPT = (
     "Замени содержимое раздела «{section}» заметки «{path}».\n\n"
     "Сейчас в разделе:\n{section_text}\n\n"
     "Пожелание пользователя:\n{text}\n\n"
-    "Верни только новое содержимое раздела, без строки заголовка."
+    "Верни только новое содержимое раздела, без строки заголовка.\n"
+    "Если по пожеланию содержимое должно исчезнуть (например, «убери все "
+    "связи»), верни пустой ответ. Не объясняй, что делаешь, не пересказывай "
+    "эту инструкцию, не пиши рассуждений — только текст раздела."
 )
 
 TOOLS: list[dict[str, Any]] = build_tools()
@@ -386,9 +389,15 @@ class Agent:
             [{"role": "user", "content": self._with_style(prompt)}],
             max_tokens=900,
         )
-        content = response.text.strip()
+        content = _clean_completion(response.text)
         if not content:
             raise LLMError("Модель вернула пустой текст заметки.")
+        if _looks_like_reasoning(content, text):
+            log.warning(
+                "Модель вернула рассуждение вместо заметки (%d симв.), не записываю",
+                len(content),
+            )
+            raise LLMError("модель вернула рассуждение вместо текста")
         title, content = _split_note(content)
         if "{{" in title:
             title = _title_from_text(text)
@@ -404,27 +413,41 @@ class Agent:
             section_text=section_text[-2000:],
             text=text,
         )
-        return await self._compose(prompt)
+        return await self._compose(prompt, source=section_text + text)
 
     async def compose_section(
         self, path: str, section: str, section_text: str, text: str
     ) -> str:
-        """Пишет новое содержимое раздела по пожеланию пользователя."""
+        """Пишет новое содержимое раздела по пожеланию пользователя.
+
+        Пустой ответ — законный результат: «убери всё из раздела» очищает его.
+        """
         prompt = COMPOSE_SECTION_PROMPT.format(
             path=path,
             section=section,
             section_text=section_text[-2000:],
             text=text,
         )
-        return await self._compose(prompt)
+        return await self._compose(
+            prompt, source=section_text + text, allow_empty=True
+        )
 
-    async def _compose(self, prompt: str) -> str:
+    async def _compose(
+        self, prompt: str, *, source: str = "", allow_empty: bool = False
+    ) -> str:
+        """Ответ модели как текст для заметки: без рассуждений и обёрток."""
         response = await self._llm.chat(
             [{"role": "user", "content": self._with_style(prompt)}], max_tokens=700
         )
-        result = response.text.strip()
-        if not result:
+        result = _clean_completion(response.text)
+        if not result and not allow_empty:
             raise LLMError("Модель вернула пустой текст.")
+        if result and _looks_like_reasoning(result, source):
+            log.warning(
+                "Модель вернула рассуждение вместо текста (%d симв.), не записываю",
+                len(result),
+            )
+            raise LLMError("модель вернула рассуждение вместо текста")
         return result
 
     def _with_style(self, prompt: str) -> str:
@@ -579,10 +602,10 @@ class Agent:
         if call.name == "add_links":
             log.info("Предложение связать заметку: %s", path)
             return AgentResult(text="", proposal=Proposal(kind="links", path=path))
-        if not content.strip():
-            return AgentResult(text="Модель предложила пустое изменение.")
 
         if call.name == "append_note":
+            if not content.strip():
+                return AgentResult(text="Модель предложила пустое изменение.")
             section = _argument(call.arguments, "section")
             log.info("Предложение дописать: %s (%d симв.)", path, len(content))
             return AgentResult(
@@ -601,6 +624,22 @@ class Agent:
             return AgentResult(text="Модель не указала раздел для правки.")
         if mode not in ("replace", "append"):
             return AgentResult(text="Неизвестный режим правки раздела.")
+
+        if not content.strip():
+            # Пустая замена — это очистка раздела: «убери все связи» и подобное.
+            if mode != "replace":
+                return AgentResult(text="Модель предложила пустое изменение.")
+            log.info("Предложение очистить раздел «%s» в %s", heading, path)
+            return AgentResult(
+                text="",
+                proposal=Proposal(
+                    kind="section",
+                    path=path,
+                    heading=heading,
+                    mode="clear",
+                    content="",
+                ),
+            )
 
         log.info("Предложение правки раздела «%s» в %s", heading, path)
         return AgentResult(

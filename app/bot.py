@@ -28,12 +28,15 @@ from app.agent import Agent, Proposal
 from app.audit import AuditLog, AuditedBackend
 from app.config import PROJECT_ROOT, Settings
 from app.links import (
+    DEFAULT_LINK_HEADING,
     add_links,
     duplicate_titles,
     existing_links,
     is_linked,
     link_label,
     mention_paths,
+    remove_links,
+    wants_remove_links,
 )
 from app.llm import LLMAllExhaustedError, LLMError, LLMPool, LLMStatus
 from app.notes import (
@@ -41,6 +44,7 @@ from app.notes import (
     append_to_section,
     build_path,
     clean_folder,
+    clear_section,
     contains_text,
     create_section,
     find_section,
@@ -734,14 +738,16 @@ async def _offer(
             return
 
     links: tuple[str, ...] = ()
-    if settings.agent_auto_link and proposal.kind in (
-        "append",
-        "section",
-        "section_create",
+    if (
+        settings.agent_auto_link
+        and proposal.mode != "clear"
+        and proposal.kind in ("append", "section", "section_create")
     ):
         links = tuple(await _proposal_links(agent, obsidian, proposal))
 
-    if _needs_confirm(settings, proposal.kind):
+    # Очистка раздела удаляет содержимое: её показываем всегда, даже в режиме
+    # «never», чтобы пустой ответ модели не стёр раздел молча.
+    if proposal.mode == "clear" or _needs_confirm(settings, proposal.kind):
         sent = await message.answer(
             _proposal_text(proposal, links), reply_markup=_confirm_keyboard()
         )
@@ -1094,14 +1100,25 @@ async def _handle_flow(
                     content=composed,
                 )
             else:
-                composed = await agent.compose_section(
-                    flow.path, flow.section, section_text, text
-                )
+                if flow.section and wants_remove_links(text):
+                    # Механическая операция: ссылки убираем без модели, чтобы
+                    # она не вернула рассуждение вместо пустого раздела.
+                    composed = remove_links(section_text).strip()
+                    log.info(
+                        "Раздел «%s»: удаление связей без модели (%d → %d симв.)",
+                        flow.section,
+                        len(section_text),
+                        len(composed),
+                    )
+                else:
+                    composed = await agent.compose_section(
+                        flow.path, flow.section, section_text, text
+                    )
                 proposal = Proposal(
                     kind="section",
                     path=flow.path,
                     heading=flow.section,
-                    mode="replace",
+                    mode="clear" if not composed.strip() else "replace",
                     content=composed,
                 )
         except LLMError as error:
@@ -1807,6 +1824,8 @@ async def _apply(
                 )
             else:
                 updated = append_to_note(current, proposal.content)
+        elif proposal.mode == "clear":
+            updated = clear_section(current, proposal.heading)
         elif proposal.mode == "replace":
             updated = replace_section(current, proposal.heading, proposal.content)
         else:
@@ -1905,6 +1924,12 @@ def _proposal_text(proposal: Proposal, links: tuple[str, ...] = ()) -> str:
         return (
             f"Дописать в {where}:\n\n{_preview(proposal.content)}{hint}"
             "\n\nПодтвердить?"
+        )
+    if proposal.kind == "section" and proposal.mode == "clear":
+        return (
+            f"Очистить раздел «{proposal.heading}» в «{proposal.path}»?\n\n"
+            "Содержимое раздела будет удалено, заголовок останется.\n\n"
+            "Подтвердить?"
         )
     verb = "Заменить" if proposal.mode == "replace" else "Дополнить"
     return (
