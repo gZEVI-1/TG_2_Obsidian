@@ -11,6 +11,7 @@ from typing import Any
 
 from app.actions import prompt_block, tools as build_tools, write_actions
 from app.config import Settings
+from app.link_rules import is_blocked
 from app.links import (
     duplicate_titles,
     existing_links,
@@ -135,7 +136,10 @@ WRITE_RULES = (
     "6. Перед удалением, переносом и копированием найди точный путь через "
     "search_notes; не выдумывай пути.\n"
     "7. Новый раздел или папку создавай только если их ещё нет; для папок "
-    "сначала посмотри list_folders.\n"
+    "сначала посмотри list_folders. Раздел — это строка Markdown с # в начале: "
+    "##, ### и т. д.; больше решёток — глубже уровень. В heading передавай "
+    "название без решёток. Если в заголовке после названия уже есть текст через "
+    "двоеточие, это содержимое раздела: в heading — только часть до двоеточия.\n"
     "8. Удаление текста — только через remove_text: передай точный фрагмент из "
     "заметки. Не вызывай append_note или edit_section с пустым текстом.\n"
     "9. Журнал изменений (`state/audit`, сущности AuditLog и AuditedBackend) — "
@@ -343,14 +347,20 @@ class Agent:
         return result
 
     async def suggest_links(
-        self, text: str, *, title: str = "", exclude_path: str = ""
+        self,
+        text: str,
+        *,
+        title: str = "",
+        exclude_path: str = "",
+        never_rules: tuple[tuple[str, str], ...] = (),
     ) -> list[str]:
         """Подбирает связи для заметки (FR-05): упоминания, поиск и модель.
 
         Возвращает готовые строки для `[[...]]` (имя или путь), исключая то,
-        что в заметке уже связано. Пустой список — предлагать нечего.
-        Автолинковку включает `AGENT_AUTO_LINK`; ручная команда вызывает
-        этот метод независимо от настройки.
+        что в заметке уже связано и что запрещено правилами «никогда не
+        ставь». Пустой список — предлагать нечего. Автолинковку включает
+        `AGENT_AUTO_LINK`; ручная команда вызывает этот метод независимо от
+        настройки.
         """
         if self._obsidian is None:
             return []
@@ -370,6 +380,9 @@ class Agent:
             (path, excerpt)
             for path, excerpt in candidates
             if not is_linked(link_label(path, duplicates), linked)
+            and not is_blocked(
+                exclude_path, link_label(path, duplicates), never_rules
+            )
         ][:MAX_LINK_CANDIDATES]
         if not candidates:
             return []

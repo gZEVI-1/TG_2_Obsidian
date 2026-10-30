@@ -25,6 +25,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
+from app import link_rules
 from app.access import AllowedUsersMiddleware
 from app.agent import Agent, Proposal
 from app.audit import AuditLog, AuditedBackend
@@ -78,9 +79,8 @@ MAX_TEMPLATE_CHOICES = 6
 MAX_BUTTON_CHARS = 40
 BULK_LINK_NOTES = 300
 BULK_LINK_EXAMPLES = 5
-# Сколько связей из плана показывать для исключения по номерам.
-BULK_LINK_PREVIEW = 40
-BULK_LINK_TEXT_BUDGET = 2800
+# План связей выводится целиком; длинный список режется на сообщения.
+BULK_TEXT_LIMIT = 3800
 # Как часто проверять, не пора ли сделать копию (сам интервал — в настройках).
 BACKUP_CHECK_SECONDS = 3600
 
@@ -99,24 +99,33 @@ BTN_NOTE_LINKS = "🔗 Связать заметку"
 BTN_LINKS = "🔗 Связи во всех заметках"
 
 # Просьба исключить связи из плана массовой простановки.
-_EXCLUDE_VERB_RE = re.compile(
+_FILTER_VERB_RE = re.compile(
     r"\b(?:не\s+ставь(?:те)?|не\s+ставить|не\s+проставляй(?:те)?|"
     r"не\s+проставлять|не\s+связывай(?:те)?|не\s+связывать|"
+    r"поставь(?:те)?\s+только|оставь(?:те)?\s+только|"
     r"убери(?:те)?|убрать|удали(?:те)?|удалить|сними(?:те)?|снять|"
     r"исключи(?:те)?|исключить)\b",
     re.IGNORECASE,
 )
-_EXCLUDE_FILLER_RE = re.compile(
+# «Поставь только …» — оставить выбранные связи, остальные не записывать.
+_ONLY_LINKS_RE = re.compile(
+    r"\b(?:поставь(?:те)?|оставь(?:те)?)\s+только\b",
+    re.IGNORECASE,
+)
+_FILTER_FILLER_RE = re.compile(
     r"^(?:связ[ьия]\w*|ссылк[аиу]\w*|заметк[аиуе]|номер\w*|"
     r"в\s+заметк[еу]|из\s+заметки|для\s+заметки|"
     r"под|на|с|со|из|в|для)\s+",
     re.IGNORECASE,
 )
-_EXCLUDE_ARROW_RE = re.compile(r"\s*(?:→|->|=>)\s*")
-_EXCLUDE_NUMBER_RE = re.compile(r"\b(\d{1,3})\b")
-_BULK_EXCLUDE_HELP = (
-    "Не понял, какие связи исключить. Пример: «не ставь 2, 5», "
-    "«не ставь [[Имя]]» или «не ставь Заметка → Имя»."
+_FILTER_ARROW_RE = re.compile(r"\s*(?:→|->|=>)\s*")
+_FILTER_NUMBER_RE = re.compile(r"\b(\d{1,3})\b")
+_FILTER_RANGE_RE = re.compile(r"\b(\d{1,3})\s*[-–—]\s*(\d{1,3})\b")
+_NEVER_LINKS_RE = re.compile(r"\b(?:никогда|навсегда)\b", re.IGNORECASE)
+LINK_RULES_FILE = "link_rules.json"
+_BULK_FILTER_HELP = (
+    "Не понял, какие связи убрать или оставить. Пример: «не ставь 2, 5» "
+    "или «поставь только 2, 5»."
 )
 
 # Страница 1: вход в чат. Страница 2: сценарии работы с заметками.
@@ -147,6 +156,7 @@ COMMANDS = [
     BotCommand(command="new", description="Новый диалог"),
     BotCommand(command="folders", description="Папки хранилища"),
     BotCommand(command="links", description="Связи во всех заметках"),
+    BotCommand(command="links_never", description="Запреты связей «никогда не ставь»"),
     BotCommand(command="rag", description="Состояние семантического поиска"),
     BotCommand(command="reindex", description="Обновить RAG-индекс"),
     BotCommand(command="audit", description="Журнал изменений"),
@@ -189,12 +199,14 @@ HELP_TEXT = (
     "Связи появляются в разделе «Связи»: при создании заметки бот предлагает "
     "их кнопкой, а в существующей — кнопкой «Связать заметку» или по просьбе "
     "«свяжи заметку…». В плане массовой простановки лишние связи можно "
-    "исключить: «не ставь 2, 5» или «не ставь [[Имя]]».\n\n"
+    "исключить («не ставь 2, 5» или «не ставь 10-15»), оставить только "
+    "выбранные («поставь только 2, 5») или запретить навсегда («никогда не "
+    "ставь 10-15»). Постоянные запреты — /links_never.\n\n"
     "Поиск понимает смысл: «что я писал про сроки релиза» найдёт заметку, "
     "даже если таких слов в ней нет. /rag — состояние индекса, /reindex — "
     "пересобрать после больших правок. /audit — последние изменения.\n\n"
-    "Команды: /start, /help, /new, /folders, /links, /rag, /reindex, /audit, "
-    "/llm — состояние моделей и лимитов."
+    "Команды: /start, /help, /new, /folders, /links, /links_never, /rag, "
+    "/reindex, /audit, /llm — состояние моделей и лимитов."
 )
 
 
@@ -644,6 +656,41 @@ async def cmd_links(
     await _offer_bulk(message, memory, settings, obsidian)
 
 
+@router.message(Command("links_never"))
+async def cmd_links_never(message: Message, settings: Settings) -> None:
+    """Показать постоянные запреты связей («никогда не ставь»)."""
+    rules = link_rules.load(settings.state_dir / LINK_RULES_FILE)
+    if not rules:
+        await message.answer(
+            "Постоянных запретов связей нет. Запрет ставится в плане массовой "
+            "простановки: «никогда не ставь 10-15»."
+        )
+        return
+    lines = ["Постоянные запреты связей:"]
+    lines.extend(f"• {link_rules.describe(source, target)}" for source, target in rules)
+    lines.append("\nСнять все запреты — кнопка ниже.")
+    chunks = _chunk_lines(lines)
+    for chunk in chunks[:-1]:
+        await message.answer(chunk)
+    await message.answer(chunks[-1], reply_markup=_never_clear_keyboard())
+
+
+@router.callback_query(F.data == "never:clear")
+async def on_never_clear(
+    callback: CallbackQuery, settings: Settings
+) -> None:
+    """Снять все постоянные запреты связей."""
+    try:
+        link_rules.save(settings.state_dir / LINK_RULES_FILE, ())
+    except OSError as error:
+        log.warning("Не удалось снять запреты связей: %s", error)
+        await callback.answer("Не удалось снять запреты: проверьте state/.")
+        return
+    await callback.answer("Запреты сняты")
+    if callback.message is not None:
+        await callback.message.edit_text("Все постоянные запреты связей сняты.")
+
+
 @router.message(F.text)
 async def answer_text(
     message: Message,
@@ -668,9 +715,9 @@ async def answer_text(
     if (
         pending is not None
         and pending.stage == "bulk"
-        and _wants_bulk_exclusion(text)
+        and _wants_bulk_filter(text)
     ):
-        await _reply_bulk_exclude(message, memory, pending, text)
+        await _reply_bulk_filter(message, memory, settings, pending, text)
         return
 
     messages = [
@@ -731,7 +778,7 @@ async def _offer(
         return
 
     if proposal.kind == "links":
-        links = tuple(await _proposal_links(agent, obsidian, proposal))
+        links = tuple(await _proposal_links(agent, obsidian, proposal, settings))
         if not links:
             memory.drop_action(chat_id)
             await message.answer("Новых связей не нашёл: всё уже связано.")
@@ -756,7 +803,7 @@ async def _offer(
         folders = await _known_folders(obsidian)
         proposal = _with_folder(proposal, folders)
         links = (
-            tuple(await _proposal_links(agent, obsidian, proposal))
+            tuple(await _proposal_links(agent, obsidian, proposal, settings))
             if settings.agent_auto_link
             else ()
         )
@@ -800,7 +847,7 @@ async def _offer(
         and proposal.mode != "clear"
         and proposal.kind in ("append", "section", "section_create")
     ):
-        links = tuple(await _proposal_links(agent, obsidian, proposal))
+        links = tuple(await _proposal_links(agent, obsidian, proposal, settings))
 
     # Очистка раздела удаляет содержимое: её показываем всегда, даже в режиме
     # «never», чтобы пустой ответ модели не стёр раздел молча.
@@ -820,7 +867,10 @@ async def _offer(
 
 
 async def _proposal_links(
-    agent: Agent, obsidian: ObsidianBackend, proposal: Proposal
+    agent: Agent,
+    obsidian: ObsidianBackend,
+    proposal: Proposal,
+    settings: Settings,
 ) -> list[str]:
     """Кандидаты связей для предложения: создание, правка или готовая заметка."""
     if proposal.kind == "create":
@@ -841,8 +891,11 @@ async def _proposal_links(
         title = proposal.path.rsplit("/", 1)[-1].removesuffix(".md")
         exclude = proposal.path
 
+    rules = link_rules.load(settings.state_dir / LINK_RULES_FILE)
     try:
-        return await agent.suggest_links(text, title=title, exclude_path=exclude)
+        return await agent.suggest_links(
+            text, title=title, exclude_path=exclude, never_rules=rules
+        )
     except (ObsidianError, aiohttp.ClientError) as error:
         log.warning("Не удалось подобрать связи: %s", error)
         return []
@@ -911,8 +964,9 @@ async def _offer_bulk(
         return
 
     status = await message.answer("Сканирую хранилище и собираю план связей…")
+    rules = link_rules.load(settings.state_dir / LINK_RULES_FILE)
     try:
-        plan, errors, total, checked = await _bulk_plan(obsidian, settings)
+        plan, errors, total, checked = await _bulk_plan(obsidian, settings, rules)
     except (ObsidianError, aiohttp.ClientError) as error:
         await status.edit_text(_obsidian_error_text(error))
         return
@@ -932,7 +986,7 @@ async def _offer_bulk(
             )
         return
 
-    text = _bulk_plan_text(
+    chunks = _bulk_plan_chunks(
         plan,
         total,
         checked,
@@ -951,10 +1005,11 @@ async def _offer_bulk(
             result = await _apply_bulk(obsidian, plan)
         finally:
             memory.end_operation(chat_id)
-        await status.edit_text(f"{text}\n\n{result}")
+        last = await _send_bulk_plan(message, chunks, first=status, confirm=False)
+        await last.answer(result)
         return
 
-    await status.edit_text(f"{text}\n\nПрименить?", reply_markup=_bulk_keyboard())
+    sent = await _send_bulk_plan(message, chunks, first=status)
     memory.set_action(
         chat_id,
         PendingAction(
@@ -965,12 +1020,14 @@ async def _offer_bulk(
             checked=checked,
             errors=tuple(errors),
         ),
-        status.message_id,
+        sent.message_id,
     )
 
 
 async def _bulk_plan(
-    obsidian: ObsidianBackend, settings: Settings
+    obsidian: ObsidianBackend,
+    settings: Settings,
+    rules: tuple[tuple[str, str], ...] = (),
 ) -> tuple[list[tuple[str, tuple[str, ...]]], list[str], int, int]:
     """Строит план: каким заметкам какие ссылки добавить (без записи).
 
@@ -998,6 +1055,8 @@ async def _bulk_plan(
         targets: list[str] = []
         for candidate in mention_paths(text, scanned, exclude=path, strict=True):
             label = link_label(candidate, duplicates)
+            if link_rules.is_blocked(path, label, rules):
+                continue
             if is_linked(label, linked) or label in targets:
                 continue
             targets.append(label)
@@ -1025,34 +1084,16 @@ def _bulk_link_items(
     return [(path, target) for path, targets in plan for target in targets]
 
 
-def _bulk_preview_items(
-    plan: tuple[tuple[str, tuple[str, ...]], ...] | list[tuple[str, tuple[str, ...]]],
-) -> list[tuple[str, str]]:
-    """Сколько связей плана реально показано в сообщении (по номерам)."""
-    shown: list[tuple[str, str]] = []
-    used = 0
-    for path, target in _bulk_link_items(plan):
-        if len(shown) >= BULK_LINK_PREVIEW:
-            break
-        line = f"{len(shown) + 1}. {path} → [[{target}]]"
-        if shown and used + len(line) + 1 > BULK_LINK_TEXT_BUDGET:
-            break
-        shown.append((path, target))
-        used += len(line) + 1
-    return shown
-
-
-def _bulk_plan_text(
+def _bulk_plan_lines(
     plan: list[tuple[str, tuple[str, ...]]],
     total: int,
     checked: int,
     errors: list[str],
     *,
     hint: bool = False,
-) -> str:
-    """Сводка плана: сколько заметок и ссылок, пронумерованные связи."""
+) -> list[str]:
+    """Все строки плана: сводка, ошибки и пронумерованные связи."""
     items = _bulk_link_items(plan)
-    shown = _bulk_preview_items(plan)
     lines = [
         "План связей:",
         f"• заметок в хранилище — {total}",
@@ -1070,35 +1111,95 @@ def _bulk_plan_text(
     lines.append("Связи:")
     lines.extend(
         f"{number}. {path} → [[{target}]]"
-        for number, (path, target) in enumerate(shown, 1)
+        for number, (path, target) in enumerate(items, 1)
     )
-    if len(shown) < len(items):
-        lines.append(f"… и ещё {len(items) - len(shown)} связей")
     if hint:
         lines.extend(
             [
                 "",
-                "Лишние связи можно исключить: «не ставь 2, 5», "
-                "«не ставь [[Имя]]» или «не ставь Заметка → Имя».",
+                "Лишние связи можно исключить: «не ставь 2, 5» или "
+                "«не ставь 10-15». Оставить только выбранные: "
+                "«поставь только 2, 5». Запретить навсегда: "
+                "«никогда не ставь 10-15».",
             ]
         )
-    return "\n".join(lines)
+    return lines
 
 
-def _wants_bulk_exclusion(text: str) -> bool:
-    """Похоже ли сообщение на просьбу исключить связи из плана.
+def _chunk_lines(lines: list[str], limit: int = BULK_TEXT_LIMIT) -> list[str]:
+    """Режет строки на сообщения Telegram, не разрывая строку связи."""
+    chunks: list[str] = []
+    current: list[str] = []
+    used = 0
+    for line in lines:
+        extra = len(line) + (1 if current else 0)
+        if current and used + extra > limit:
+            chunks.append("\n".join(current))
+            current = []
+            used = 0
+        current.append(line)
+        used += len(line) + (1 if len(current) > 1 else 0)
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
+def _bulk_plan_chunks(
+    plan: list[tuple[str, tuple[str, ...]]],
+    total: int,
+    checked: int,
+    errors: list[str],
+    *,
+    hint: bool = False,
+) -> list[str]:
+    """План целиком, разбитый на сообщения; связи не обрезаются."""
+    return _chunk_lines(_bulk_plan_lines(plan, total, checked, errors, hint=hint))
+
+
+async def _send_bulk_plan(
+    message: Message,
+    chunks: list[str],
+    *,
+    first: Message | None = None,
+    prefix: str = "",
+    confirm: bool = True,
+) -> Message:
+    """Отправляет план целиком; кнопки подтверждения — на последнем куске."""
+    if not chunks:
+        return first or message
+    head = f"{prefix}{chunks[0]}"
+    keyboard = _bulk_keyboard() if confirm else None
+    if len(chunks) == 1:
+        text = f"{head}\n\nПрименить?" if confirm else head
+        if first is not None:
+            await first.edit_text(text, reply_markup=keyboard)
+            return first
+        return await message.answer(text, reply_markup=keyboard)
+
+    if first is not None:
+        await first.edit_text(head)
+    else:
+        await message.answer(head)
+    for chunk in chunks[1:-1]:
+        await message.answer(chunk)
+    tail = f"{chunks[-1]}\n\nПрименить?" if confirm else chunks[-1]
+    return await message.answer(tail, reply_markup=keyboard)
+
+
+def _wants_bulk_filter(text: str) -> bool:
+    """Похоже ли сообщение на просьбу изменить связи в плане.
 
     Обычные просьбы вроде «убери заметку» не перехватываются: для них нужен
     признак связи (слово, `[[ссылка]]`, номер или стрелка).
     """
-    if not _EXCLUDE_VERB_RE.search(text):
+    if not _FILTER_VERB_RE.search(text):
         return False
     lowered = text.casefold()
     if re.search(r"\b(связ|ссылк)", lowered):
         return True
-    if LINK_RE.search(text) or _EXCLUDE_ARROW_RE.search(text):
+    if LINK_RE.search(text) or _FILTER_ARROW_RE.search(text):
         return True
-    if _EXCLUDE_NUMBER_RE.search(text):
+    if _FILTER_NUMBER_RE.search(text):
         return True
     if re.search(
         r"\b(?:не\s+ставь|не\s+ставить|не\s+связывай|не\s+связывать|"
@@ -1109,33 +1210,47 @@ def _wants_bulk_exclusion(text: str) -> bool:
     return not re.search(r"\b(заметк|файл|папк)", lowered)
 
 
-def _exclude_bulk_links(
+def _filter_numbers(text: str) -> tuple[set[int], str]:
+    """Номера и диапазоны из просьбы; ошибка — обратный диапазон."""
+    numbers = {
+        int(number)
+        for number in _FILTER_NUMBER_RE.findall(_FILTER_RANGE_RE.sub(" ", text))
+    }
+    for start, end in _FILTER_RANGE_RE.findall(text):
+        first, last = int(start), int(end)
+        if first > last:
+            return set(), f"Диапазон {first}–{last}: начало больше конца."
+        numbers.update(range(first, last + 1))
+    return numbers, ""
+
+
+def _select_bulk_indexes(
     text: str,
     plan: tuple[tuple[str, tuple[str, ...]], ...],
-) -> tuple[tuple[tuple[str, tuple[str, ...]], ...], int, str]:
-    """Убирает связи из плана по номерам, цели или паре «заметка → цель».
+) -> tuple[set[int], str]:
+    """Номера связей из плана, которые упомянуты в просьбе.
 
-    Возвращает (новый план, сколько связей убрано, текст ошибки). Пустая
-    ошибка — план изменён; непустая — план остаётся прежним.
+    Понимает номера, цели `[[Имя]]` и пары «заметка → цель». Возвращает
+    (номера, текст ошибки); ошибка — просьба не разобрана.
     """
     items = _bulk_link_items(plan)
     if not items:
-        return plan, 0, _BULK_EXCLUDE_HELP
+        return set(), _BULK_FILTER_HELP
 
-    arrow = _EXCLUDE_ARROW_RE.search(text)
+    arrow = _FILTER_ARROW_RE.search(text)
     if arrow is not None:
-        source = _clean_exclusion_name(text[: arrow.start()])
+        source = _clean_filter_name(text[: arrow.start()])
         target = _clean_link_name(text[arrow.end() :])
         if not source or not target:
-            return plan, 0, _BULK_EXCLUDE_HELP
+            return set(), _BULK_FILTER_HELP
         indexes = {
             index
             for index, (path, label) in enumerate(items)
             if _same_note(path, source) and _same_link(label, target)
         }
         if not indexes:
-            return plan, 0, f"В плане нет связи «{source} → {target}»."
-        return _drop_bulk_items(plan, indexes)
+            return set(), f"В плане нет связи «{source} → {target}»."
+        return indexes, ""
 
     names = [link_target(raw) for raw in LINK_RE.findall(text)]
     names = [name for name in names if name]
@@ -1147,33 +1262,65 @@ def _exclude_bulk_links(
         }
         if not indexes:
             listed = ", ".join(f"[[{name}]]" for name in names)
-            return plan, 0, f"В плане нет такой связи: {listed}."
-        return _drop_bulk_items(plan, indexes)
+            return set(), f"В плане нет такой связи: {listed}."
+        return indexes, ""
 
-    numbers = _EXCLUDE_NUMBER_RE.findall(text)
-    leftover = _clean_exclusion_name(_EXCLUDE_NUMBER_RE.sub(" ", text))
+    numbers = _filter_numbers(text)
+    if numbers[1]:
+        return set(), numbers[1]
+    remainder = _FILTER_RANGE_RE.sub(" ", text)
+    remainder = _FILTER_NUMBER_RE.sub(" ", remainder)
+    leftover = _clean_filter_name(remainder)
     leftover = re.sub(r"\bи\b", " ", leftover).strip(" \t.,;:—–-")
-    if numbers and not leftover:
-        shown = len(_bulk_preview_items(plan))
-        chosen = {int(number) for number in numbers}
-        wrong = sorted(number for number in chosen if number < 1 or number > shown)
+    if numbers[0] and not leftover:
+        chosen = numbers[0]
+        wrong = sorted(number for number in chosen if number < 1 or number > len(items))
         if wrong:
-            return plan, 0, (
-                f"В плане нет номера {wrong[0]}. Показаны номера 1–{shown}."
+            return set(), (
+                f"В плане нет номера {wrong[0]}. Показаны номера 1–{len(items)}."
             )
-        return _drop_bulk_items(plan, {number - 1 for number in chosen})
+        return {number - 1 for number in chosen}, ""
 
     target = _clean_link_name(text)
     if not target:
-        return plan, 0, _BULK_EXCLUDE_HELP
+        return set(), _BULK_FILTER_HELP
     indexes = {
         index
         for index, (_path, label) in enumerate(items)
         if _same_link(label, target)
     }
     if not indexes:
-        return plan, 0, f"В плане нет связи [[{target}]]."
+        return set(), f"В плане нет связи [[{target}]]."
+    return indexes, ""
+
+
+def _exclude_bulk_links(
+    text: str,
+    plan: tuple[tuple[str, tuple[str, ...]], ...],
+) -> tuple[tuple[tuple[str, tuple[str, ...]], ...], int, str]:
+    """Убирает связи из плана по номерам, цели или паре «заметка → цель».
+
+    Возвращает (новый план, сколько связей убрано, текст ошибки). Пустая
+    ошибка — план изменён; непустая — план остаётся прежним.
+    """
+    indexes, error = _select_bulk_indexes(text, plan)
+    if error:
+        return plan, 0, error
     return _drop_bulk_items(plan, indexes)
+
+
+def _select_bulk_links(
+    text: str,
+    plan: tuple[tuple[str, tuple[str, ...]], ...],
+) -> tuple[tuple[tuple[str, tuple[str, ...]], ...], int, str]:
+    """Оставляет в плане только выбранные связи.
+
+    Возвращает (новый план, сколько связей оставлено, текст ошибки).
+    """
+    indexes, error = _select_bulk_indexes(text, plan)
+    if error:
+        return plan, 0, error
+    return _keep_bulk_items(plan, indexes)
 
 
 def _drop_bulk_items(
@@ -1190,13 +1337,28 @@ def _drop_bulk_items(
     return new_plan, len(items) - len(_bulk_link_items(new_plan)), ""
 
 
-def _clean_exclusion_name(text: str) -> str:
-    """Убирает из просьбы глагол, кавычки и служебные слова."""
-    value = _EXCLUDE_VERB_RE.sub(" ", text)
+def _keep_bulk_items(
+    plan: tuple[tuple[str, tuple[str, ...]], ...],
+    indexes: set[int],
+) -> tuple[tuple[tuple[str, tuple[str, ...]], ...], int, str]:
+    """Собирает план только из связей с указанными плоскими номерами."""
+    items = _bulk_link_items(plan)
+    grouped: dict[str, list[str]] = {}
+    for index, (path, target) in enumerate(items):
+        if index in indexes:
+            grouped.setdefault(path, []).append(target)
+    new_plan = tuple((path, tuple(targets)) for path, targets in grouped.items())
+    return new_plan, len(_bulk_link_items(new_plan)), ""
+
+
+def _clean_filter_name(text: str) -> str:
+    """Убирает из просьбы глагол, «никогда», кавычки и служебные слова."""
+    value = _FILTER_VERB_RE.sub(" ", text)
+    value = _NEVER_LINKS_RE.sub(" ", value)
     value = re.sub(r"[«»\"`\[\]]", " ", value)
     value = value.strip(" \t.,:;!?—–-")
     while True:
-        cleaned = _EXCLUDE_FILLER_RE.sub("", value, count=1)
+        cleaned = _FILTER_FILLER_RE.sub("", value, count=1)
         cleaned = cleaned.strip(" \t.,:;!?—–-")
         if cleaned == value:
             break
@@ -1206,7 +1368,7 @@ def _clean_exclusion_name(text: str) -> str:
 
 def _clean_link_name(text: str) -> str:
     """Имя цели из просьбы: без алиаса и якоря."""
-    return link_target(_clean_exclusion_name(text))
+    return link_target(_clean_filter_name(text))
 
 
 def _same_note(path: str, value: str) -> bool:
@@ -1231,35 +1393,185 @@ def _same_link(label: str, value: str) -> bool:
     return wanted == current or wanted.rsplit("/", 1)[-1] == current.rsplit("/", 1)[-1]
 
 
-async def _reply_bulk_exclude(
+def _never_rules_from_text(
+    text: str,
+    plan: tuple[tuple[str, tuple[str, ...]], ...],
+    indexes: set[int],
+) -> tuple[tuple[tuple[str, str], ...], str]:
+    """Правила из просьбы «никогда не ставь …»."""
+    numbers, range_error = _filter_numbers(text)
+    if range_error:
+        return (), range_error
+    if _FILTER_ARROW_RE.search(text) or numbers:
+        items = _bulk_link_items(plan)
+        return tuple(items[index] for index in sorted(indexes)), ""
+
+    names = [link_target(raw) for raw in LINK_RE.findall(text)]
+    names = [name for name in names if name]
+    if names:
+        return tuple((link_rules.WILDCARD, name) for name in names), ""
+    target = _clean_link_name(text)
+    if not target:
+        return (), _BULK_FILTER_HELP
+    return ((link_rules.WILDCARD, target),), ""
+
+
+def _drop_blocked_bulk_items(
+    plan: tuple[tuple[str, tuple[str, ...]], ...],
+    rules: tuple[tuple[str, str], ...],
+) -> tuple[tuple[tuple[str, tuple[str, ...]], ...], int]:
+    """Убирает из плана связи, запрещённые постоянными правилами."""
+    items = _bulk_link_items(plan)
+    grouped: dict[str, list[str]] = {}
+    kept = 0
+    for path, target in items:
+        if link_rules.is_blocked(path, target, rules):
+            continue
+        grouped.setdefault(path, []).append(target)
+        kept += 1
+    new_plan = tuple((path, tuple(targets)) for path, targets in grouped.items())
+    return new_plan, len(items) - kept
+
+
+def _apply_never_links(
+    settings: Settings,
+    plan: tuple[tuple[str, tuple[str, ...]], ...],
+    text: str,
+) -> tuple[tuple[tuple[str, tuple[str, ...]], ...], int, int, str]:
+    """Сохраняет запреты «никогда не ставь» и убирает их из плана.
+
+    Возвращает (новый план, убрано из плана, сколько правил добавлено,
+    текст ошибки).
+    """
+    indexes, error = _select_bulk_indexes(text, plan)
+    if error:
+        return plan, 0, 0, error
+    rules, error = _never_rules_from_text(text, plan, indexes)
+    if error:
+        return plan, 0, 0, error
+
+    path = settings.state_dir / LINK_RULES_FILE
+    current = link_rules.load(path)
+    updated = current
+    for source, target in rules:
+        updated = link_rules.add(updated, source, target)
+    if len(updated) != len(current):
+        try:
+            link_rules.save(path, updated)
+        except OSError as error:
+            log.warning("Не удалось сохранить запреты связей: %s", error)
+            return (
+                plan,
+                0,
+                0,
+                "Не удалось сохранить правило: проверьте доступ к state/.",
+            )
+
+    new_plan, removed = _drop_blocked_bulk_items(plan, updated)
+    return new_plan, removed, len(updated) - len(current), ""
+
+
+async def _reply_bulk_filter(
     message: Message,
     memory: ChatMemory,
+    settings: Settings,
     pending: PendingAction,
     text: str,
 ) -> None:
-    """Исключает связи из показанного плана и ждёт подтверждения снова."""
+    """Меняет план: убирает связи, оставляет выбранные или запрещает навсегда."""
     chat_id = message.chat.id
-    log.info("Исключаю связи из плана: %s", text)
-    plan, removed, error = _exclude_bulk_links(text, pending.plan)
+    log.info("Меняю план связей: %s", text)
+    never = bool(_NEVER_LINKS_RE.search(text))
+    only = bool(_ONLY_LINKS_RE.search(text))
+    if never and only:
+        await message.answer(
+            "Не понял: «никогда не ставь» и «поставь только» одновременно. "
+            "Выберите одно — план не изменён."
+        )
+        return
+
+    if never:
+        plan, removed, saved, error = _apply_never_links(
+            settings, pending.plan, text
+        )
+        if error:
+            await message.answer(
+                f"{error}\n\nПлан не изменён. Пример: «никогда не ставь 10-15»."
+            )
+            return
+        if not plan:
+            memory.drop_action(chat_id)
+            pointer = f"Добавлено правил: {saved}." if saved else "Правило уже было."
+            await message.answer(
+                f"Запомнил навсегда. {pointer} В плане не осталось связей — "
+                "применять нечего. План отменён."
+            )
+            return
+        chunks = _bulk_plan_chunks(
+            list(plan), pending.total, pending.checked, list(pending.errors), hint=True
+        )
+        prefix = (
+            f"Запомнил навсегда, новых правил: {saved}. "
+            if saved
+            else "Такое правило уже было. "
+        )
+        prefix += (
+            f"Убрано из плана: {removed}. Посмотреть и снять: /links_never.\n\n"
+        )
+        sent = await _send_bulk_plan(message, chunks, prefix=prefix)
+        memory.set_action(
+            chat_id,
+            PendingAction(
+                Proposal(kind="bulk"),
+                "bulk",
+                plan=plan,
+                total=pending.total,
+                checked=pending.checked,
+                errors=pending.errors,
+            ),
+            sent.message_id,
+        )
+        return
+
+    if only:
+        plan, kept, error = _select_bulk_links(text, pending.plan)
+    else:
+        plan, removed, error = _exclude_bulk_links(text, pending.plan)
     if error:
         await message.answer(
-            f"{error}\n\nПлан не изменён. Пример: «не ставь 2, 5»."
+            f"{error}\n\nПлан не изменён. Пример: «не ставь 2, 5» "
+            "или «поставь только 2, 5»."
         )
         return
     if not plan:
         memory.drop_action(chat_id)
-        await message.answer(
-            f"Исключил все связи ({removed}) — применять нечего. План отменён."
-        )
+        if only:
+            await message.answer(
+                "По условию «поставь только» не осталось связей — "
+                "применять нечего. План отменён."
+            )
+        else:
+            await message.answer(
+                f"Исключил все связи ({removed}) — применять нечего. "
+                "План отменён."
+            )
         return
 
-    body = _bulk_plan_text(
+    chunks = _bulk_plan_chunks(
         list(plan), pending.total, pending.checked, list(pending.errors), hint=True
     )
-    sent = await message.answer(
-        f"Исключено связей: {removed}.\n\n{body}\n\nПрименить?",
-        reply_markup=_bulk_keyboard(),
-    )
+    if only:
+        prefix = f"Оставлено связей: {kept}."
+        if kept < len(_bulk_link_items(pending.plan)):
+            prefix += (
+                " Остальные не записаны — в следующий раз они снова появятся "
+                "в плане."
+            )
+        prefix += "\n\n"
+    else:
+        prefix = f"Исключено связей: {removed}.\n\n"
+
+    sent = await _send_bulk_plan(message, chunks, prefix=prefix)
     memory.set_action(
         chat_id,
         PendingAction(
@@ -1325,7 +1637,8 @@ def _section_text(note: str, heading: str) -> str:
     if span is None:
         return note[-2000:]
     lines = note.splitlines()
-    return "\n".join(lines[span.start : span.end]).strip()
+    body = "\n".join(lines[span.start : span.end]).strip()
+    return "\n".join(part for part in (span.inline, body) if part)
 
 
 async def _handle_flow(
@@ -2379,6 +2692,18 @@ def _bulk_keyboard() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="Применить", callback_data="act:bulk:yes"),
                 InlineKeyboardButton(text="Отмена", callback_data="act:no"),
+            ]
+        ]
+    )
+
+
+def _never_clear_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Разрешить все связи", callback_data="never:clear"
+                )
             ]
         ]
     )

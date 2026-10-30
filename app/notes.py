@@ -35,6 +35,54 @@ class Section:
     level: int
     start: int
     end: int
+    inline: str = ""
+
+
+def _split_heading_title(title: str) -> tuple[str, str]:
+    """Делит заголовок на название и текст после двоеточия.
+
+    `### Братья/сестры : Тетя Оксана` → («Братья/сестры», «Тетя Оксана»).
+    Двоеточие в самом названии сохраняется, если после него ничего нет.
+    """
+    cleaned = title.strip()
+    match = re.match(r"^(.*?)\s*[:：]\s*(.*)$", cleaned)
+    if not match:
+        return cleaned, ""
+    name = match.group(1).strip()
+    tail = match.group(2).strip()
+    if not name or name.casefold() in ("http", "https"):
+        return cleaned, ""
+    return name, tail
+
+
+def _display_heading(title: str) -> str:
+    """Название раздела для кнопок: без решёток, ссылок и разметки."""
+    name, _tail = _split_heading_title(title)
+    name = re.sub(r"[*_`]+", "", name)
+    name = name.replace("[[", " ").replace("]]", " ")
+    return re.sub(r"\s+", " ", name).strip()
+
+
+def _normalize_heading(value: str) -> str:
+    """Нормализует заголовок для сравнения: текст, а не разметка."""
+    text = unicodedata.normalize("NFKC", value).casefold().replace("ё", "е")
+    text = re.sub(r"[*_`]+", "", text)
+    text = text.replace("[[", " ").replace("]]", " ")
+    text = re.sub(r"\s*/\s*", "/", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" \t#:;,.!?—–-")
+
+
+def _heading_match_kind(actual: str, wanted: str) -> int:
+    """0 — не совпало, 1 — совпало название, 2 — совпал заголовок целиком."""
+    wanted_key = _normalize_heading(wanted)
+    if not wanted_key:
+        return 0
+    if _normalize_heading(actual) == wanted_key:
+        return 2
+    if _normalize_heading(_split_heading_title(actual)[0]) == wanted_key:
+        return 1
+    return 0
 
 
 def slugify(title: str) -> str:
@@ -133,6 +181,14 @@ def find_section(text: str, heading: str) -> Section | None:
     return sections[0] if sections else None
 
 
+def _missing_section_message(text: str, heading: str) -> str:
+    names = sections(text)
+    if not names:
+        return f"раздел «{heading}» не найден"
+    shown = ", ".join(f"«{name}»" for name in names[:6])
+    return f"раздел «{heading}» не найден. Есть: {shown}"
+
+
 def replace_section(text: str, heading: str, body: str) -> str:
     """Заменяет тело раздела, сохраняя frontmatter и остальные разделы.
 
@@ -140,9 +196,17 @@ def replace_section(text: str, heading: str, body: str) -> str:
     """
     section = find_section(text, heading)
     if section is None:
-        raise ValueError(f"раздел «{heading}» не найден")
+        raise ValueError(_missing_section_message(text, heading))
 
     lines = text.splitlines(keepends=True)
+    if section.inline:
+        heading_line = lines[section.start - 1]
+        match = _HEADING_RE.match(heading_line.rstrip("\r\n"))
+        if match is not None:
+            name = _display_heading(match.group(2))
+            ending = "\r\n" if heading_line.endswith("\r\n") else "\n"
+            lines[section.start - 1] = f"{match.group(1)} {name}{ending}"
+
     has_next = section.end < len(lines)
     clean = body.strip("\n")
     if clean:
@@ -161,10 +225,13 @@ def append_to_section(text: str, heading: str, body: str) -> str:
     """Дописывает текст в конец существующего раздела."""
     section = find_section(text, heading)
     if section is None:
-        raise ValueError(f"раздел «{heading}» не найден")
+        raise ValueError(_missing_section_message(text, heading))
 
     lines = text.splitlines(keepends=True)
-    existing = "".join(lines[section.start : section.end]).strip("\n")
+    body_text = "".join(lines[section.start : section.end]).strip("\n")
+    existing = "\n".join(
+        part for part in (section.inline, body_text) if part
+    )
     return replace_section(text, heading, _join_blocks(existing, body.strip("\n")))
 
 
@@ -267,7 +334,9 @@ def sections(text: str) -> list[str]:
     for line in text.splitlines():
         match = _HEADING_RE.match(line.rstrip("\n"))
         if match and len(match.group(1)) >= 2:
-            result.append(match.group(2).strip())
+            name = _display_heading(match.group(2))
+            if name:
+                result.append(name)
     return result
 
 
@@ -452,25 +521,35 @@ def _collapse_blank_lines(text: str) -> str:
 
 
 def _sections(text: str, heading: str) -> list[Section]:
-    target = heading.strip().lower()
-    if target.startswith("#"):
-        target = target.lstrip("#").strip()
-
     lines = text.splitlines(keepends=True)
-    headings: list[tuple[int, int, str]] = []
+    headings: list[tuple[int, int, str, str]] = []
     for index, line in enumerate(lines):
         match = _HEADING_RE.match(line.rstrip("\n"))
-        if match:
-            headings.append((index, len(match.group(1)), match.group(2).strip().lower()))
+        if not match:
+            continue
+        title = match.group(2).strip()
+        _name, inline = _split_heading_title(title)
+        headings.append((index, len(match.group(1)), title, inline))
+
+    matches: list[tuple[int, int, int, int, str]] = []
+    for position, (index, level, title, inline) in enumerate(headings):
+        kind = _heading_match_kind(title, heading)
+        if kind:
+            matches.append((kind, position, index, level, inline))
+    if not matches:
+        return []
+    best = max(kind for kind, _, _, _, _ in matches)
 
     result: list[Section] = []
-    for position, (index, level, title) in enumerate(headings):
-        if title != target:
+    for kind, position, index, level, inline in matches:
+        if kind != best:
             continue
         end = len(lines)
-        for next_index, next_level, _ in headings[position + 1 :]:
+        for next_index, next_level, _, _ in headings[position + 1 :]:
             if next_level <= level:
                 end = next_index
                 break
-        result.append(Section(level=level, start=index + 1, end=end))
+        result.append(
+            Section(level=level, start=index + 1, end=end, inline=inline)
+        )
     return result

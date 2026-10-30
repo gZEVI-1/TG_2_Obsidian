@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from app import link_rules
 from app.agent import Agent
 from app.bot import (
-    _bulk_plan_text,
+    BULK_TEXT_LIMIT,
+    _apply_never_links,
+    _bulk_plan,
+    _bulk_plan_chunks,
     _exclude_bulk_links,
-    _wants_bulk_exclusion,
+    _never_rules_from_text,
+    _select_bulk_links,
+    _wants_bulk_filter,
 )
 from app.config import Settings, load_settings
 from app.links import (
@@ -176,17 +183,26 @@ class LinkSettingsTests(unittest.TestCase):
 
 
 class FakeBackend:
-    """Хранилище без сети: список заметок и результаты поиска."""
+    """Хранилище без сети: список заметок, тексты и результаты поиска."""
 
-    def __init__(self, notes: list[str], hits: list[dict[str, str]] | None = None) -> None:
+    def __init__(
+        self,
+        notes: list[str],
+        hits: list[dict[str, str]] | None = None,
+        texts: dict[str, str] | None = None,
+    ) -> None:
         self.notes = notes
         self.hits = hits or []
+        self.texts = texts or {}
 
     async def list_notes(self) -> list[str]:
         return list(self.notes)
 
     async def search_notes(self, query: str, limit: int = 5) -> list[dict[str, str]]:
         return list(self.hits)
+
+    async def read_note(self, path: str) -> str:
+        return self.texts.get(path, "")
 
 
 class FakeLLM:
@@ -237,6 +253,21 @@ class SuggestLinksTests(unittest.TestCase):
             asyncio.run(agent.suggest_links("Болтовня про идеи.")), []
         )
 
+    def test_never_rules_are_not_offered(self) -> None:
+        backend = FakeBackend(
+            ["Projects/Проект Альфа.md", "Notes/Идеи.md"]
+        )
+        llm = FakeLLM("Projects/Проект Альфа.md")
+        agent = Agent(llm, backend, make_settings())
+        links = asyncio.run(
+            agent.suggest_links(
+                "Обсудили Идеи и Проект Альфа.",
+                never_rules=((link_rules.WILDCARD, "Идеи"),),
+            )
+        )
+        self.assertEqual(links, ["Проект Альфа"])
+        self.assertNotIn("Notes/Идеи.md", llm.prompts[0])
+
     def test_fallback_uses_mentions_when_model_fails(self) -> None:
         backend = FakeBackend(["Notes/Идеи.md"])
         agent = Agent(FakeLLM(fail=True), backend, make_settings())
@@ -245,21 +276,24 @@ class SuggestLinksTests(unittest.TestCase):
         )
 
 
-class BulkExclusionTests(unittest.TestCase):
-    """Исключение связей из плана массовой простановки."""
+class BulkFilterTests(unittest.TestCase):
+    """Исключение и выбор связей из плана массовой простановки."""
 
     plan = (
         ("Notes/Альфа.md", ("Идеи", "Проект Бета")),
         ("Notes/Гамма.md", ("Идеи",)),
     )
 
-    def test_exclusion_request_is_recognized(self) -> None:
-        self.assertTrue(_wants_bulk_exclusion("не ставь 2, 5"))
-        self.assertTrue(_wants_bulk_exclusion("убери связь [[Идеи]]"))
-        self.assertTrue(_wants_bulk_exclusion("удали связи 2"))
-        self.assertFalse(_wants_bulk_exclusion("свяжи заметку Идеи"))
-        self.assertFalse(_wants_bulk_exclusion("проставить все связи"))
-        self.assertFalse(_wants_bulk_exclusion("убери заметку Идеи"))
+    def test_filter_request_is_recognized(self) -> None:
+        self.assertTrue(_wants_bulk_filter("не ставь 2, 5"))
+        self.assertTrue(_wants_bulk_filter("убери связь [[Идеи]]"))
+        self.assertTrue(_wants_bulk_filter("удали связи 2"))
+        self.assertTrue(_wants_bulk_filter("поставь только 2, 5"))
+        self.assertTrue(_wants_bulk_filter("оставь только [[Идеи]]"))
+        self.assertTrue(_wants_bulk_filter("никогда не ставь 1-2"))
+        self.assertFalse(_wants_bulk_filter("свяжи заметку Идеи"))
+        self.assertFalse(_wants_bulk_filter("проставить все связи"))
+        self.assertFalse(_wants_bulk_filter("убери заметку Идеи"))
 
     def test_excludes_by_number(self) -> None:
         plan, removed, error = _exclude_bulk_links("не ставь 2", self.plan)
@@ -330,16 +364,217 @@ class BulkExclusionTests(unittest.TestCase):
         self.assertEqual(removed, 0)
         self.assertIn("Нет такой", error)
 
-    def test_preview_numbers_links_and_hints(self) -> None:
-        text = _bulk_plan_text(list(self.plan), 10, 5, [], hint=True)
+    def test_only_keeps_selected_number(self) -> None:
+        plan, kept, error = _select_bulk_links("поставь только 2", self.plan)
+        self.assertEqual(error, "")
+        self.assertEqual(kept, 1)
+        self.assertEqual(plan, (("Notes/Альфа.md", ("Проект Бета",)),))
+
+    def test_only_keeps_several_numbers(self) -> None:
+        plan, kept, _error = _select_bulk_links("поставь только 1 и 3", self.plan)
+        self.assertEqual(kept, 2)
+        self.assertEqual(
+            plan,
+            (
+                ("Notes/Альфа.md", ("Идеи",)),
+                ("Notes/Гамма.md", ("Идеи",)),
+            ),
+        )
+
+    def test_only_keeps_by_target(self) -> None:
+        plan, kept, _error = _select_bulk_links("поставь только [[Идеи]]", self.plan)
+        self.assertEqual(kept, 2)
+        self.assertEqual(
+            plan,
+            (
+                ("Notes/Альфа.md", ("Идеи",)),
+                ("Notes/Гамма.md", ("Идеи",)),
+            ),
+        )
+
+    def test_only_keeps_pair(self) -> None:
+        plan, kept, _error = _select_bulk_links(
+            "поставь только Гамма → Идеи", self.plan
+        )
+        self.assertEqual(kept, 1)
+        self.assertEqual(plan, (("Notes/Гамма.md", ("Идеи",)),))
+
+    def test_only_keeps_everything(self) -> None:
+        plan, kept, _error = _select_bulk_links("поставь только 1, 2, 3", self.plan)
+        self.assertEqual(kept, 3)
+        self.assertEqual(plan, self.plan)
+
+    def test_only_unknown_number_keeps_plan(self) -> None:
+        plan, kept, error = _select_bulk_links("поставь только 99", self.plan)
+        self.assertEqual(plan, self.plan)
+        self.assertEqual(kept, 0)
+        self.assertIn("99", error)
+
+    def test_excludes_range(self) -> None:
+        plan, removed, error = _exclude_bulk_links("не ставь 1-2", self.plan)
+        self.assertEqual(error, "")
+        self.assertEqual(removed, 2)
+        self.assertEqual(plan, (("Notes/Гамма.md", ("Идеи",)),))
+
+    def test_never_range_selects_same_indexes(self) -> None:
+        plan, removed, error = _exclude_bulk_links(
+            "никогда не ставь 1-2", self.plan
+        )
+        self.assertEqual(error, "")
+        self.assertEqual(removed, 2)
+        self.assertEqual(plan, (("Notes/Гамма.md", ("Идеи",)),))
+
+    def test_only_keeps_range(self) -> None:
+        plan, kept, error = _select_bulk_links("поставь только 2-3", self.plan)
+        self.assertEqual(error, "")
+        self.assertEqual(kept, 2)
+        self.assertEqual(
+            plan,
+            (
+                ("Notes/Альфа.md", ("Проект Бета",)),
+                ("Notes/Гамма.md", ("Идеи",)),
+            ),
+        )
+
+    def test_reversed_range_keeps_plan(self) -> None:
+        plan, removed, error = _exclude_bulk_links("не ставь 3-1", self.plan)
+        self.assertEqual(plan, self.plan)
+        self.assertEqual(removed, 0)
+        self.assertIn("начало больше конца", error)
+
+    def test_never_number_range_becomes_pair_rules(self) -> None:
+        rules, error = _never_rules_from_text(
+            "никогда не ставь 1-2", self.plan, {0, 1}
+        )
+        self.assertEqual(error, "")
+        self.assertEqual(
+            rules,
+            (
+                ("Notes/Альфа.md", "Идеи"),
+                ("Notes/Альфа.md", "Проект Бета"),
+            ),
+        )
+
+    def test_never_target_becomes_global_rule(self) -> None:
+        rules, error = _never_rules_from_text(
+            "никогда не ставь [[Идеи]]", self.plan, {0, 2}
+        )
+        self.assertEqual(error, "")
+        self.assertEqual(rules, ((link_rules.WILDCARD, "Идеи"),))
+
+    def test_never_pair_becomes_pair_rule(self) -> None:
+        rules, error = _never_rules_from_text(
+            "никогда не ставь Гамма → Идеи", self.plan, {2}
+        )
+        self.assertEqual(error, "")
+        self.assertEqual(rules, (("Notes/Гамма.md", "Идеи"),))
+
+    def test_never_rule_is_saved_and_removed_from_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as folder, patch(
+            "app.config.PROJECT_ROOT", Path(folder)
+        ):
+            plan, removed, saved, error = _apply_never_links(
+                make_settings(), self.plan, "никогда не ставь 2"
+            )
+            self.assertEqual(error, "")
+            self.assertEqual(saved, 1)
+            self.assertEqual(removed, 1)
+            self.assertEqual(
+                plan,
+                (
+                    ("Notes/Альфа.md", ("Идеи",)),
+                    ("Notes/Гамма.md", ("Идеи",)),
+                ),
+            )
+            stored = link_rules.load(Path(folder) / "state" / "link_rules.json")
+            self.assertEqual(stored, (("Notes/Альфа", "Проект Бета"),))
+
+    def test_chunks_show_all_links_and_hints(self) -> None:
+        chunks = _bulk_plan_chunks(list(self.plan), 10, 5, [], hint=True)
+        text = "\n".join(chunks)
         self.assertIn("• новых ссылок — 3", text)
         self.assertIn("1. Notes/Альфа.md → [[Идеи]]", text)
         self.assertIn("3. Notes/Гамма.md → [[Идеи]]", text)
         self.assertIn("не ставь 2, 5", text)
+        self.assertIn("поставь только 2, 5", text)
+        self.assertNotIn("ещё", text)
 
-    def test_preview_without_hint_has_no_exclusion_prompt(self) -> None:
-        text = _bulk_plan_text(list(self.plan), 10, 5, [])
+    def test_chunks_without_hint_have_no_prompt(self) -> None:
+        text = "\n".join(_bulk_plan_chunks(list(self.plan), 10, 5, []))
         self.assertNotIn("исключить", text)
+        self.assertNotIn("поставь только", text)
+
+    def test_long_plan_is_split_but_not_truncated(self) -> None:
+        plan = [
+            (
+                f"Projects/Очень длинное имя заметки номер {index}.md",
+                tuple(f"Цель {index}-{number}" for number in range(4)),
+            )
+            for index in range(30)
+        ]
+        chunks = _bulk_plan_chunks(plan, 100, 50, [], hint=True)
+        text = "\n".join(chunks)
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(len(chunk) <= BULK_TEXT_LIMIT for chunk in chunks))
+        self.assertIn("120. Projects/", text)
+        self.assertNotIn("ещё", text)
+
+
+class LinkRuleTests(unittest.TestCase):
+    """Постоянные запреты связей: хранение и применение."""
+
+    def test_roundtrip_and_pair_match(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "link_rules.json"
+            rules = link_rules.add((), "Notes/Альфа.md", "[[Идеи|мысли]]")
+            self.assertEqual(rules, (("Notes/Альфа", "Идеи"),))
+            link_rules.save(path, rules)
+            loaded = link_rules.load(path)
+            self.assertTrue(link_rules.is_blocked("Notes/Альфа.md", "Идеи", loaded))
+            self.assertFalse(
+                link_rules.is_blocked("Notes/Другая.md", "Идеи", loaded)
+            )
+
+    def test_pair_rule_is_tied_to_path(self) -> None:
+        rules = (("Notes/Альфа", "Идеи"),)
+        self.assertTrue(link_rules.is_blocked("Notes/Альфа.md", "Идеи", rules))
+        self.assertFalse(
+            link_rules.is_blocked("Archive/Альфа.md", "Идеи", rules)
+        )
+
+    def test_global_rule_blocks_any_source(self) -> None:
+        rules = ((link_rules.WILDCARD, "Notes/Идеи"),)
+        self.assertTrue(link_rules.is_blocked("Notes/Любая.md", "Идеи", rules))
+        self.assertFalse(link_rules.is_blocked("Notes/Любая.md", "Другое", rules))
+
+    def test_duplicate_rule_is_not_added(self) -> None:
+        rules = link_rules.add((), "Notes/Альфа.md", "Идеи")
+        again = link_rules.add(rules, "Notes/Альфа", "Notes/Идеи")
+        self.assertEqual(again, rules)
+
+    def test_broken_file_is_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "link_rules.json"
+            path.write_text("{oops", encoding="utf-8")
+            self.assertEqual(link_rules.load(path), ())
+
+
+class BulkPlanRulesTests(unittest.TestCase):
+    """Массовая простановка не предлагает связи, запрещённые навсегда."""
+
+    def test_never_rule_excludes_target_from_plan(self) -> None:
+        backend = FakeBackend(
+            ["Notes/Заметка.md", "Notes/Идеи.md", "Projects/Проект Альфа.md"],
+            texts={"Notes/Заметка.md": "Упомянул Идеи и Проект Альфа."},
+        )
+        plan, _errors, _total, _checked = asyncio.run(
+            _bulk_plan(
+                backend,
+                make_settings(),
+                ((link_rules.WILDCARD, "Идеи"),),
+            )
+        )
+        self.assertEqual(plan, [("Notes/Заметка.md", ("Проект Альфа",))])
 
 
 if __name__ == "__main__":
