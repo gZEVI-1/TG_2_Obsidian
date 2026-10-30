@@ -8,6 +8,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.agent import Agent
+from app.bot import (
+    _bulk_plan_text,
+    _exclude_bulk_links,
+    _wants_bulk_exclusion,
+)
 from app.config import Settings, load_settings
 from app.links import (
     add_links,
@@ -238,6 +243,103 @@ class SuggestLinksTests(unittest.TestCase):
         self.assertEqual(
             asyncio.run(agent.suggest_links("Болтовня про идеи.")), ["Идеи"]
         )
+
+
+class BulkExclusionTests(unittest.TestCase):
+    """Исключение связей из плана массовой простановки."""
+
+    plan = (
+        ("Notes/Альфа.md", ("Идеи", "Проект Бета")),
+        ("Notes/Гамма.md", ("Идеи",)),
+    )
+
+    def test_exclusion_request_is_recognized(self) -> None:
+        self.assertTrue(_wants_bulk_exclusion("не ставь 2, 5"))
+        self.assertTrue(_wants_bulk_exclusion("убери связь [[Идеи]]"))
+        self.assertTrue(_wants_bulk_exclusion("удали связи 2"))
+        self.assertFalse(_wants_bulk_exclusion("свяжи заметку Идеи"))
+        self.assertFalse(_wants_bulk_exclusion("проставить все связи"))
+        self.assertFalse(_wants_bulk_exclusion("убери заметку Идеи"))
+
+    def test_excludes_by_number(self) -> None:
+        plan, removed, error = _exclude_bulk_links("не ставь 2", self.plan)
+        self.assertEqual(error, "")
+        self.assertEqual(removed, 1)
+        self.assertEqual(
+            plan,
+            (
+                ("Notes/Альфа.md", ("Идеи",)),
+                ("Notes/Гамма.md", ("Идеи",)),
+            ),
+        )
+
+    def test_excludes_several_numbers_with_conjunction(self) -> None:
+        plan, removed, _error = _exclude_bulk_links("не ставь 1 и 3", self.plan)
+        self.assertEqual(removed, 2)
+        self.assertEqual(plan, (("Notes/Альфа.md", ("Проект Бета",)),))
+
+    def test_excludes_all_links(self) -> None:
+        plan, removed, _error = _exclude_bulk_links("исключи 1, 2, 3", self.plan)
+        self.assertEqual(removed, 3)
+        self.assertEqual(plan, ())
+
+    def test_excludes_by_target_name(self) -> None:
+        plan, removed, _error = _exclude_bulk_links(
+            "не ставь [[Идеи]]", self.plan
+        )
+        self.assertEqual(removed, 2)
+        self.assertEqual(plan, (("Notes/Альфа.md", ("Проект Бета",)),))
+
+    def test_excludes_by_target_without_brackets(self) -> None:
+        plan, removed, _error = _exclude_bulk_links("не ставь Идеи", self.plan)
+        self.assertEqual(removed, 2)
+        self.assertEqual(plan, (("Notes/Альфа.md", ("Проект Бета",)),))
+
+    def test_excludes_pair_by_note_name(self) -> None:
+        plan, removed, _error = _exclude_bulk_links(
+            "не ставь Альфа → Проект Бета", self.plan
+        )
+        self.assertEqual(removed, 1)
+        self.assertEqual(
+            plan,
+            (
+                ("Notes/Альфа.md", ("Идеи",)),
+                ("Notes/Гамма.md", ("Идеи",)),
+            ),
+        )
+
+    def test_excludes_pair_by_note_path(self) -> None:
+        plan, removed, _error = _exclude_bulk_links(
+            "не ставь Notes/Гамма.md → [[Идеи]]", self.plan
+        )
+        self.assertEqual(removed, 1)
+        self.assertEqual(
+            plan,
+            (("Notes/Альфа.md", ("Идеи", "Проект Бета")),),
+        )
+
+    def test_unknown_number_keeps_plan(self) -> None:
+        plan, removed, error = _exclude_bulk_links("не ставь 99", self.plan)
+        self.assertEqual(plan, self.plan)
+        self.assertEqual(removed, 0)
+        self.assertIn("99", error)
+
+    def test_unknown_target_keeps_plan(self) -> None:
+        plan, removed, error = _exclude_bulk_links("не ставь [[Нет такой]]", self.plan)
+        self.assertEqual(plan, self.plan)
+        self.assertEqual(removed, 0)
+        self.assertIn("Нет такой", error)
+
+    def test_preview_numbers_links_and_hints(self) -> None:
+        text = _bulk_plan_text(list(self.plan), 10, 5, [], hint=True)
+        self.assertIn("• новых ссылок — 3", text)
+        self.assertIn("1. Notes/Альфа.md → [[Идеи]]", text)
+        self.assertIn("3. Notes/Гамма.md → [[Идеи]]", text)
+        self.assertIn("не ставь 2, 5", text)
+
+    def test_preview_without_hint_has_no_exclusion_prompt(self) -> None:
+        text = _bulk_plan_text(list(self.plan), 10, 5, [])
+        self.assertNotIn("исключить", text)
 
 
 if __name__ == "__main__":

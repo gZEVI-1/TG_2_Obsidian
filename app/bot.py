@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from contextlib import suppress
 from dataclasses import dataclass, replace
@@ -31,11 +32,13 @@ from app.backup import backup_if_due
 from app.config import PROJECT_ROOT, Settings
 from app.links import (
     DEFAULT_LINK_HEADING,
+    LINK_RE,
     add_links,
     duplicate_titles,
     existing_links,
     is_linked,
     link_label,
+    link_target,
     mention_paths,
     remove_links,
     wants_remove_links,
@@ -75,6 +78,9 @@ MAX_TEMPLATE_CHOICES = 6
 MAX_BUTTON_CHARS = 40
 BULK_LINK_NOTES = 300
 BULK_LINK_EXAMPLES = 5
+# Сколько связей из плана показывать для исключения по номерам.
+BULK_LINK_PREVIEW = 40
+BULK_LINK_TEXT_BUDGET = 2800
 # Как часто проверять, не пора ли сделать копию (сам интервал — в настройках).
 BACKUP_CHECK_SECONDS = 3600
 
@@ -89,7 +95,29 @@ BTN_NOTE_APPEND = "➕ Дописать"
 BTN_NOTE_EDIT = "✏️ Править раздел"
 BTN_NOTE_FIND = "🔎 Найти"
 BTN_FOLDERS = "🗂 Папки"
+BTN_NOTE_LINKS = "🔗 Связать заметку"
 BTN_LINKS = "🔗 Связи во всех заметках"
+
+# Просьба исключить связи из плана массовой простановки.
+_EXCLUDE_VERB_RE = re.compile(
+    r"\b(?:не\s+ставь(?:те)?|не\s+ставить|не\s+проставляй(?:те)?|"
+    r"не\s+проставлять|не\s+связывай(?:те)?|не\s+связывать|"
+    r"убери(?:те)?|убрать|удали(?:те)?|удалить|сними(?:те)?|снять|"
+    r"исключи(?:те)?|исключить)\b",
+    re.IGNORECASE,
+)
+_EXCLUDE_FILLER_RE = re.compile(
+    r"^(?:связ[ьия]\w*|ссылк[аиу]\w*|заметк[аиуе]|номер\w*|"
+    r"в\s+заметк[еу]|из\s+заметки|для\s+заметки|"
+    r"под|на|с|со|из|в|для)\s+",
+    re.IGNORECASE,
+)
+_EXCLUDE_ARROW_RE = re.compile(r"\s*(?:→|->|=>)\s*")
+_EXCLUDE_NUMBER_RE = re.compile(r"\b(\d{1,3})\b")
+_BULK_EXCLUDE_HELP = (
+    "Не понял, какие связи исключить. Пример: «не ставь 2, 5», "
+    "«не ставь [[Имя]]» или «не ставь Заметка → Имя»."
+)
 
 # Страница 1: вход в чат. Страница 2: сценарии работы с заметками.
 KEYBOARD_HOME = ReplyKeyboardMarkup(
@@ -106,6 +134,7 @@ KEYBOARD_SCENARIOS = ReplyKeyboardMarkup(
         [KeyboardButton(text=BTN_NOTE_NEW), KeyboardButton(text=BTN_NOTE_APPEND)],
         [KeyboardButton(text=BTN_NOTE_EDIT), KeyboardButton(text=BTN_NOTE_FIND)],
         [KeyboardButton(text=BTN_FOLDERS)],
+        [KeyboardButton(text=BTN_NOTE_LINKS)],
         [KeyboardButton(text=BTN_LINKS)],
         [KeyboardButton(text=BTN_BACK)],
     ],
@@ -147,6 +176,7 @@ HELP_TEXT = (
     "• ✏️ Править раздел — заменить раздел целиком;\n"
     "• 🔎 Найти — показать заметку;\n"
     "• 🗂 Папки — список папок хранилища;\n"
+    "• 🔗 Связать заметку — выбрать заметку и добавить ей связи;\n"
     "• 🔗 Связи во всех заметках — план и массовая простановка связей;\n"
     "• ⬅️ Назад — вернуться на первую страницу.\n\n"
     "Обычными словами можно и больше:\n"
@@ -157,7 +187,9 @@ HELP_TEXT = (
     "Опасные действия бот показывает превью и выполняет только после "
     "подтверждения.\n\n"
     "Связи появляются в разделе «Связи»: при создании заметки бот предлагает "
-    "их кнопкой, а в существующей — по просьбе «свяжи заметку…».\n\n"
+    "их кнопкой, а в существующей — кнопкой «Связать заметку» или по просьбе "
+    "«свяжи заметку…». В плане массовой простановки лишние связи можно "
+    "исключить: «не ставь 2, 5» или «не ставь [[Имя]]».\n\n"
     "Поиск понимает смысл: «что я писал про сроки релиза» найдёт заметку, "
     "даже если таких слов в ней нет. /rag — состояние индекса, /reindex — "
     "пересобрать после больших правок. /audit — последние изменения.\n\n"
@@ -171,18 +203,21 @@ class PendingAction:
     """Предложение, которое ждёт решения пользователя."""
 
     proposal: Proposal
-    stage: str  # folder | auto | confirm | exists | links
+    stage: str  # folder | auto | confirm | exists | links | bulk
     path: str = ""
     folders: tuple[str, ...] = ()
     links: tuple[str, ...] = ()
     plan: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    total: int = 0
+    checked: int = 0
+    errors: tuple[str, ...] = ()
 
 
 @dataclass
 class Flow:
     """Пошаговый сценарий, запущенный кнопкой (без участия модели)."""
 
-    kind: str  # create | append | edit | find
+    kind: str  # create | append | edit | find | links
     step: str  # template | text | note | pick_note | section | content
     path: str = ""
     section: str = ""
@@ -546,6 +581,16 @@ async def btn_note_find(message: Message, memory: ChatMemory) -> None:
     )
 
 
+@router.message(F.text == BTN_NOTE_LINKS)
+async def btn_note_links(message: Message, memory: ChatMemory) -> None:
+    """Связать одну заметку: выбор заметки, затем автоподбор связей."""
+    memory.set_flow(message.chat.id, Flow("links", "note"))
+    await message.answer(
+        "Какую заметку связать? Напишите часть названия или слово из текста.",
+        reply_markup=_flow_cancel_keyboard(),
+    )
+
+
 @router.message(Command("folders"))
 @router.message(F.text == BTN_FOLDERS)
 async def cmd_folders(
@@ -618,6 +663,14 @@ async def answer_text(
     pending = memory.get_action_any(chat_id)
     if pending is not None and pending.stage in ("folder", "folder_input"):
         await _reply_folder(message, memory, settings, obsidian, pending, text)
+        return
+
+    if (
+        pending is not None
+        and pending.stage == "bulk"
+        and _wants_bulk_exclusion(text)
+    ):
+        await _reply_bulk_exclude(message, memory, pending, text)
         return
 
     messages = [
@@ -879,7 +932,13 @@ async def _offer_bulk(
             )
         return
 
-    text = _bulk_plan_text(plan, total, checked, errors)
+    text = _bulk_plan_text(
+        plan,
+        total,
+        checked,
+        errors,
+        hint=settings.agent_confirmation != "never",
+    )
     if settings.agent_confirmation == "never":
         memory.drop_action(chat_id)
         if not memory.begin_operation(chat_id, "простановка связей"):
@@ -898,7 +957,14 @@ async def _offer_bulk(
     await status.edit_text(f"{text}\n\nПрименить?", reply_markup=_bulk_keyboard())
     memory.set_action(
         chat_id,
-        PendingAction(Proposal(kind="bulk"), "confirm", plan=tuple(plan)),
+        PendingAction(
+            Proposal(kind="bulk"),
+            "bulk",
+            plan=tuple(plan),
+            total=total,
+            checked=checked,
+            errors=tuple(errors),
+        ),
         status.message_id,
     )
 
@@ -952,33 +1018,260 @@ def _is_template_note(path: str, settings: Settings) -> bool:
     return bool(folder) and value.startswith(f"{folder}/")
 
 
+def _bulk_link_items(
+    plan: tuple[tuple[str, tuple[str, ...]], ...] | list[tuple[str, tuple[str, ...]]],
+) -> list[tuple[str, str]]:
+    """Плоский список связей плана: (заметка, цель ссылки)."""
+    return [(path, target) for path, targets in plan for target in targets]
+
+
+def _bulk_preview_items(
+    plan: tuple[tuple[str, tuple[str, ...]], ...] | list[tuple[str, tuple[str, ...]]],
+) -> list[tuple[str, str]]:
+    """Сколько связей плана реально показано в сообщении (по номерам)."""
+    shown: list[tuple[str, str]] = []
+    used = 0
+    for path, target in _bulk_link_items(plan):
+        if len(shown) >= BULK_LINK_PREVIEW:
+            break
+        line = f"{len(shown) + 1}. {path} → [[{target}]]"
+        if shown and used + len(line) + 1 > BULK_LINK_TEXT_BUDGET:
+            break
+        shown.append((path, target))
+        used += len(line) + 1
+    return shown
+
+
 def _bulk_plan_text(
     plan: list[tuple[str, tuple[str, ...]]],
     total: int,
     checked: int,
     errors: list[str],
+    *,
+    hint: bool = False,
 ) -> str:
-    """Сводка плана: сколько заметок, сколько ссылок, примеры."""
-    links_count = sum(len(targets) for _, targets in plan)
+    """Сводка плана: сколько заметок и ссылок, пронумерованные связи."""
+    items = _bulk_link_items(plan)
+    shown = _bulk_preview_items(plan)
     lines = [
         "План связей:",
         f"• заметок в хранилище — {total}",
         f"• проверено — {checked}",
         f"• изменятся — {len(plan)}",
-        f"• новых ссылок — {links_count}",
+        f"• новых ссылок — {len(items)}",
     ]
     if total > checked:
         lines.append(f"• пропущено — {total - checked} (шаблоны или лимит)")
-    for path, targets in plan[:BULK_LINK_EXAMPLES]:
-        links = ", ".join(f"[[{target}]]" for target in targets)
-        lines.append(f"• {path}: {links}")
-    if len(plan) > BULK_LINK_EXAMPLES:
-        lines.append(f"… и ещё {len(plan) - BULK_LINK_EXAMPLES} заметок")
     if errors:
         lines.append("")
         lines.append(f"Не прочитаны ({len(errors)}):")
         lines.extend(f"• {error}" for error in errors[:BULK_LINK_EXAMPLES])
+    lines.append("")
+    lines.append("Связи:")
+    lines.extend(
+        f"{number}. {path} → [[{target}]]"
+        for number, (path, target) in enumerate(shown, 1)
+    )
+    if len(shown) < len(items):
+        lines.append(f"… и ещё {len(items) - len(shown)} связей")
+    if hint:
+        lines.extend(
+            [
+                "",
+                "Лишние связи можно исключить: «не ставь 2, 5», "
+                "«не ставь [[Имя]]» или «не ставь Заметка → Имя».",
+            ]
+        )
     return "\n".join(lines)
+
+
+def _wants_bulk_exclusion(text: str) -> bool:
+    """Похоже ли сообщение на просьбу исключить связи из плана.
+
+    Обычные просьбы вроде «убери заметку» не перехватываются: для них нужен
+    признак связи (слово, `[[ссылка]]`, номер или стрелка).
+    """
+    if not _EXCLUDE_VERB_RE.search(text):
+        return False
+    lowered = text.casefold()
+    if re.search(r"\b(связ|ссылк)", lowered):
+        return True
+    if LINK_RE.search(text) or _EXCLUDE_ARROW_RE.search(text):
+        return True
+    if _EXCLUDE_NUMBER_RE.search(text):
+        return True
+    if re.search(
+        r"\b(?:не\s+ставь|не\s+ставить|не\s+связывай|не\s+связывать|"
+        r"исключи|исключите|исключить)\b",
+        lowered,
+    ):
+        return True
+    return not re.search(r"\b(заметк|файл|папк)", lowered)
+
+
+def _exclude_bulk_links(
+    text: str,
+    plan: tuple[tuple[str, tuple[str, ...]], ...],
+) -> tuple[tuple[tuple[str, tuple[str, ...]], ...], int, str]:
+    """Убирает связи из плана по номерам, цели или паре «заметка → цель».
+
+    Возвращает (новый план, сколько связей убрано, текст ошибки). Пустая
+    ошибка — план изменён; непустая — план остаётся прежним.
+    """
+    items = _bulk_link_items(plan)
+    if not items:
+        return plan, 0, _BULK_EXCLUDE_HELP
+
+    arrow = _EXCLUDE_ARROW_RE.search(text)
+    if arrow is not None:
+        source = _clean_exclusion_name(text[: arrow.start()])
+        target = _clean_link_name(text[arrow.end() :])
+        if not source or not target:
+            return plan, 0, _BULK_EXCLUDE_HELP
+        indexes = {
+            index
+            for index, (path, label) in enumerate(items)
+            if _same_note(path, source) and _same_link(label, target)
+        }
+        if not indexes:
+            return plan, 0, f"В плане нет связи «{source} → {target}»."
+        return _drop_bulk_items(plan, indexes)
+
+    names = [link_target(raw) for raw in LINK_RE.findall(text)]
+    names = [name for name in names if name]
+    if names:
+        indexes = {
+            index
+            for index, (_path, label) in enumerate(items)
+            if any(_same_link(label, name) for name in names)
+        }
+        if not indexes:
+            listed = ", ".join(f"[[{name}]]" for name in names)
+            return plan, 0, f"В плане нет такой связи: {listed}."
+        return _drop_bulk_items(plan, indexes)
+
+    numbers = _EXCLUDE_NUMBER_RE.findall(text)
+    leftover = _clean_exclusion_name(_EXCLUDE_NUMBER_RE.sub(" ", text))
+    leftover = re.sub(r"\bи\b", " ", leftover).strip(" \t.,;:—–-")
+    if numbers and not leftover:
+        shown = len(_bulk_preview_items(plan))
+        chosen = {int(number) for number in numbers}
+        wrong = sorted(number for number in chosen if number < 1 or number > shown)
+        if wrong:
+            return plan, 0, (
+                f"В плане нет номера {wrong[0]}. Показаны номера 1–{shown}."
+            )
+        return _drop_bulk_items(plan, {number - 1 for number in chosen})
+
+    target = _clean_link_name(text)
+    if not target:
+        return plan, 0, _BULK_EXCLUDE_HELP
+    indexes = {
+        index
+        for index, (_path, label) in enumerate(items)
+        if _same_link(label, target)
+    }
+    if not indexes:
+        return plan, 0, f"В плане нет связи [[{target}]]."
+    return _drop_bulk_items(plan, indexes)
+
+
+def _drop_bulk_items(
+    plan: tuple[tuple[str, tuple[str, ...]], ...],
+    indexes: set[int],
+) -> tuple[tuple[tuple[str, tuple[str, ...]], ...], int, str]:
+    """Собирает план без связей с указанными плоскими номерами."""
+    items = _bulk_link_items(plan)
+    grouped: dict[str, list[str]] = {}
+    for index, (path, target) in enumerate(items):
+        if index not in indexes:
+            grouped.setdefault(path, []).append(target)
+    new_plan = tuple((path, tuple(targets)) for path, targets in grouped.items())
+    return new_plan, len(items) - len(_bulk_link_items(new_plan)), ""
+
+
+def _clean_exclusion_name(text: str) -> str:
+    """Убирает из просьбы глагол, кавычки и служебные слова."""
+    value = _EXCLUDE_VERB_RE.sub(" ", text)
+    value = re.sub(r"[«»\"`\[\]]", " ", value)
+    value = value.strip(" \t.,:;!?—–-")
+    while True:
+        cleaned = _EXCLUDE_FILLER_RE.sub("", value, count=1)
+        cleaned = cleaned.strip(" \t.,:;!?—–-")
+        if cleaned == value:
+            break
+        value = cleaned
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _clean_link_name(text: str) -> str:
+    """Имя цели из просьбы: без алиаса и якоря."""
+    return link_target(_clean_exclusion_name(text))
+
+
+def _same_note(path: str, value: str) -> bool:
+    """Совпадает ли заметка из плана с именем или путём из просьбы."""
+    wanted = (
+        value.replace("\\", "/").strip().strip("/").removesuffix(".md").casefold()
+    )
+    if not wanted:
+        return False
+    current = (
+        path.replace("\\", "/").strip().strip("/").removesuffix(".md").casefold()
+    )
+    return wanted in (current, current.rsplit("/", 1)[-1])
+
+
+def _same_link(label: str, value: str) -> bool:
+    """Совпадает ли цель ссылки из плана с именем или путём из просьбы."""
+    wanted = link_target(value).replace("\\", "/").strip().strip("/").casefold()
+    if not wanted:
+        return False
+    current = label.replace("\\", "/").strip().strip("/").casefold()
+    return wanted == current or wanted.rsplit("/", 1)[-1] == current.rsplit("/", 1)[-1]
+
+
+async def _reply_bulk_exclude(
+    message: Message,
+    memory: ChatMemory,
+    pending: PendingAction,
+    text: str,
+) -> None:
+    """Исключает связи из показанного плана и ждёт подтверждения снова."""
+    chat_id = message.chat.id
+    log.info("Исключаю связи из плана: %s", text)
+    plan, removed, error = _exclude_bulk_links(text, pending.plan)
+    if error:
+        await message.answer(
+            f"{error}\n\nПлан не изменён. Пример: «не ставь 2, 5»."
+        )
+        return
+    if not plan:
+        memory.drop_action(chat_id)
+        await message.answer(
+            f"Исключил все связи ({removed}) — применять нечего. План отменён."
+        )
+        return
+
+    body = _bulk_plan_text(
+        list(plan), pending.total, pending.checked, list(pending.errors), hint=True
+    )
+    sent = await message.answer(
+        f"Исключено связей: {removed}.\n\n{body}\n\nПрименить?",
+        reply_markup=_bulk_keyboard(),
+    )
+    memory.set_action(
+        chat_id,
+        PendingAction(
+            Proposal(kind="bulk"),
+            "bulk",
+            plan=plan,
+            total=pending.total,
+            checked=pending.checked,
+            errors=pending.errors,
+        ),
+        sent.message_id,
+    )
 
 
 async def _apply_bulk(
@@ -1077,7 +1370,7 @@ async def _handle_flow(
         return
 
     if flow.step == "note":
-        await _flow_search(message, memory, obsidian, flow, text)
+        await _flow_search(message, agent, memory, settings, obsidian, flow, text)
         return
 
     if flow.step == "content":
@@ -1144,7 +1437,9 @@ async def _handle_flow(
 
 async def _flow_search(
     message: Message,
+    agent: Agent,
     memory: ChatMemory,
+    settings: Settings,
     obsidian: ObsidianBackend,
     flow: Flow,
     query: str,
@@ -1173,7 +1468,7 @@ async def _flow_search(
         return
 
     if len(paths) == 1:
-        await _flow_pick(message, memory, obsidian, flow, paths[0])
+        await _flow_pick(message, agent, memory, settings, obsidian, flow, paths[0])
         return
 
     flow.candidates = tuple(paths[:5])
@@ -1196,7 +1491,9 @@ async def _flow_search(
 
 async def _flow_pick(
     message: Message,
+    agent: Agent,
     memory: ChatMemory,
+    settings: Settings,
     obsidian: ObsidianBackend,
     flow: Flow,
     path: str,
@@ -1216,6 +1513,18 @@ async def _flow_pick(
         await message.answer(
             f"«{path}»:\n\n{_preview(note)}",
             reply_markup=_keyboard_for(chat_id, memory),
+        )
+        return
+
+    if flow.kind == "links":
+        memory.clear_flow(chat_id)
+        await _offer(
+            message,
+            agent,
+            memory,
+            settings,
+            obsidian,
+            Proposal(kind="links", path=path),
         )
         return
 
@@ -1313,7 +1622,11 @@ async def on_flow_template(
 
 @router.callback_query(F.data.startswith("flow:note:"))
 async def on_flow_note(
-    callback: CallbackQuery, memory: ChatMemory, obsidian: ObsidianBackend
+    callback: CallbackQuery,
+    agent: Agent,
+    memory: ChatMemory,
+    settings: Settings,
+    obsidian: ObsidianBackend,
 ) -> None:
     await callback.answer()
     flow = await _active_flow(callback, memory, "pick_note")
@@ -1324,7 +1637,15 @@ async def on_flow_note(
     if index >= len(flow.candidates):
         await callback.message.edit_text("Этот вариант больше не актуален.")
         return
-    await _flow_pick(callback.message, memory, obsidian, flow, flow.candidates[index])
+    await _flow_pick(
+        callback.message,
+        agent,
+        memory,
+        settings,
+        obsidian,
+        flow,
+        flow.candidates[index],
+    )
 
 
 @router.callback_query(F.data.startswith("flow:section:"))
